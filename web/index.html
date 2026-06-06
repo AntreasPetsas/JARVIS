@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>J.A.R.V.I.S</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="bg-grid"></div>
+  <div id="scanlines"></div>
+  <div id="vignette"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◉</span>
+      <div class="brand-text">
+        <span class="brand-name" id="assistant-name">J.A.R.V.I.S</span>
+        <span class="brand-sub">Just A Rather Very Intelligent System</span>
+      </div>
+    </div>
+    <div class="status">
+      <span id="clock" class="clock">--:--:--</span>
+      <span id="date" class="date">—</span>
+      <span id="conn" class="badge offline">CONNECTING</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="col col-left">
+      <div class="panel" id="panel-weather">
+        <div class="panel-h"><span>WEATHER</span><span class="dot"></span></div>
+        <div class="panel-b" id="weather-body"><div class="muted">Awaiting telemetry…</div></div>
+      </div>
+      <div class="panel" id="panel-reminders">
+        <div class="panel-h"><span>REMINDERS</span><span class="dot"></span></div>
+        <div class="panel-b" id="reminders-body"><div class="muted">No tasks logged.</div></div>
+      </div>
+      <div class="panel" id="panel-nowplaying">
+        <div class="panel-h"><span>NOW PLAYING</span><span class="dot"></span></div>
+        <div class="panel-b" id="nowplaying-body"><div class="muted">Spotify idle.</div></div>
+      </div>
+    </section>
+
+    <section class="col col-center">
+      <div class="reactor-wrap">
+        <canvas id="reactor" width="440" height="440"></canvas>
+      </div>
+      <div class="state-label" id="state-label">INITIALISING</div>
+      <div class="subtitle" id="subtitle">Establishing uplink…</div>
+    </section>
+
+    <section class="col col-right">
+      <div class="panel" id="panel-software">
+        <div class="panel-h"><span>SOFTWARE · NEWS</span><span class="dot"></span></div>
+        <div class="panel-b" id="software-body"><div class="muted">Awaiting feed…</div></div>
+      </div>
+      <div class="panel" id="panel-hobby">
+        <div class="panel-h"><span>HOBBIES · NEWS</span><span class="dot"></span></div>
+        <div class="panel-b" id="hobby-body"><div class="muted">Awaiting feed…</div></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="dock">
+    <button id="mic-btn" class="mic" title="Click to talk — or just say 'Hey Jarvis'">🎙</button>
+    <form id="cmd-form" class="cmd">
+      <input id="cmd-input" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Speak to Jarvis…   e.g.   what's the weather   ·   brief me   ·   open spotify   ·   remind me to ship the PR" />
+      <button type="submit">SEND</button>
+    </form>
+    <button id="brief-btn" class="ghost" title="Run the daily briefing">BRIEF ME</button>
+  </footer>
+
+  <div id="transcript" class="transcript"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

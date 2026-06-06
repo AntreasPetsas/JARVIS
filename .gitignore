@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# User config & secrets
+config.yaml
+.env
+
+# Runtime data
+jarvis/data/
+*.log
+
+# Downloaded models / caches
+models/
+.cache/
+
+# IDE / tool workspace files
+.claude/
+.vscode/
+.idea/

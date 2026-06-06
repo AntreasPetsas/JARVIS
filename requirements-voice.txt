@@ -1,0 +1,11 @@
+# Layer 2 — voice pipeline (heavier; install after Layer 1 works)
+# Wake word + STT use onnxruntime (has Python 3.13 wheels); we avoid tflite-runtime.
+edge-tts>=6.1          # text-to-speech (free, high quality, needs internet)
+sounddevice>=0.4       # microphone capture (bundles PortAudio, no compiler needed)
+numpy>=1.26
+openwakeword>=0.6      # "hey jarvis" wake word (run with inference_framework="onnx")
+onnxruntime>=1.17
+faster-whisper>=1.0    # speech-to-text (ctranslate2 backend, CPU or CUDA)
+
+# Cloud LLM is optional and uses plain HTTP (httpx) — no SDK needed.
+# Ollama (local) also uses plain HTTP. Nothing to install here for LLM.

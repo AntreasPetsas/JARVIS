@@ -1,0 +1,63 @@
+# Jarvis configuration.
+# Copy this file to "config.yaml" and edit. Values in config.yaml override these defaults.
+
+location:
+  city: "London"          # geocoded to lat/lon automatically for weather
+  units: "metric"         # metric | imperial
+
+assistant:
+  name: "Jarvis"
+  wake_word: "hey_jarvis"     # openWakeWord pretrained model id
+  wake_sensitivity: 0.5       # 0..1 — higher = triggers more easily
+  voice: "en-GB-RyanNeural"   # edge-tts voice. en-GB-RyanNeural / en-GB-SoniaNeural sound Jarvis-like
+
+voice:
+  enabled: true            # run the mic loop: "Hey Jarvis" wake word + speech-to-text
+  tts: true                # speak replies with edge-tts (the browser plays the audio)
+  input_device: null       # null = default mic; or set a device index/name
+  stt_model: "base"        # whisper size: tiny | base | small (bigger = better, slower)
+  stt_device: "cpu"        # cpu | cuda  (cpu keeps VRAM free for the LLM)
+  silence_rms: 0.015       # raise if it cuts you off; lower if it waits too long
+  max_command_seconds: 7
+  wake_debug: true         # prints "Hey Jarvis" scores to the server console; set false once tuned
+
+llm:
+  provider: "ollama"          # ollama | anthropic | openai | none
+  model: "qwen2.5:7b-instruct"  # ollama model tag. For 4GB VRAM also good: llama3.2:3b, qwen2.5:3b
+  host: "http://localhost:11434"
+  max_tokens: 500
+  tools: true                 # let the model pick skills itself (tool-calling) for off-keyword
+                              # requests, e.g. "should I take a jacket?" -> checks the weather.
+                              # Needs a tool-capable model (llama3.1+, qwen2.5, gpt-4o, Claude).
+  # Cloud keys (if provider is anthropic/openai) go in .env
+
+news:
+  software:
+    enabled: true
+    sources: ["hackernews", "devto"]   # any of: hackernews | devto | reddit
+    reddit_subs: ["programming", "ExperiencedDevs"]
+    limit: 6
+  hobbies:
+    # Each entry is an RSS feed. Add/replace with your own hobbies.
+    - label: "Formula 1"
+      rss: "https://www.autosport.com/rss/f1/news/"
+    - label: "Gaming"
+      rss: "https://www.eurogamer.net/feed"
+
+spotify:
+  exe_path: ""   # optional; if empty Jarvis uses the "spotify:" protocol
+  # --- Web API (optional): richer control — play by name, volume, now-playing ---
+  # 1. Create an app at https://developer.spotify.com/dashboard
+  # 2. Add the redirect URI below to that app's settings
+  # 3. Put its Client ID/Secret in .env, then say "connect Spotify" to Jarvis
+  redirect_uri: "http://127.0.0.1:8765/spotify/callback"
+  default_device: ""   # optional Spotify Connect device name to target (e.g. "DESKTOP-PC")
+
+briefing:
+  on_startup: true
+  sections: ["greeting", "weather", "software_news", "hobby_news", "reminders"]
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  open_browser: true

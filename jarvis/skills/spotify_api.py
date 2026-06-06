@@ -202,6 +202,35 @@ class SpotifyWeb:
                 return named.get("id")
         return devices[0].get("id")
 
+    async def list_devices(self) -> dict:
+        """Spoken summary of the available Spotify Connect devices."""
+        devices = await self._devices()
+        if not devices:
+            return {"ok": False, "no_device": True,
+                    "message": "No Spotify devices are available. Open Spotify somewhere first."}
+        names = [d.get("name", "?") for d in devices]
+        active = next((d.get("name") for d in devices if d.get("is_active")), None)
+        msg = "Available devices: " + ", ".join(names) + "."
+        if active:
+            msg += f" {active} is active."
+        return {"ok": True, "devices": devices, "message": msg}
+
+    async def transfer_to(self, name_query: str, play: bool = True) -> dict:
+        """Move playback to the device whose name best matches `name_query`."""
+        name_query = (name_query or "").strip().lower()
+        devices = await self._devices()
+        if not devices:
+            return {"ok": False, "no_device": True,
+                    "message": "No Spotify devices are available. Open Spotify somewhere first."}
+        match = next((d for d in devices if name_query in (d.get("name", "").lower())), None)
+        if not match:
+            names = ", ".join(d.get("name", "?") for d in devices)
+            return {"ok": False, "message": f"I couldn't find a device called "
+                                            f"'{name_query}'. You have: {names}."}
+        status, body = await self._api("PUT", "/me/player",
+                                       json_body={"device_ids": [match["id"]], "play": play})
+        return self._result(status, f"Playing on {match.get('name', 'that device')}.", body)
+
     # ---- transport ------------------------------------------------------
     async def play(self) -> dict:
         dev = await self._target_device()
@@ -245,17 +274,106 @@ class SpotifyWeb:
                                             "exact level, like 'volume 50'."}
         return await self.set_volume(cur + delta)
 
+    # ---- shuffle / repeat -----------------------------------------------
+    async def set_shuffle(self, on: bool) -> dict:
+        dev = await self._target_device()
+        params = {"state": "true" if on else "false"}
+        if dev:
+            params["device_id"] = dev
+        status, body = await self._api("PUT", "/me/player/shuffle", params=params)
+        return self._result(status, "Shuffle on." if on else "Shuffle off.", body)
+
+    async def set_repeat(self, mode: str) -> dict:
+        mode = mode if mode in ("off", "track", "context") else "context"
+        dev = await self._target_device()
+        params = {"state": mode}
+        if dev:
+            params["device_id"] = dev
+        status, body = await self._api("PUT", "/me/player/repeat", params=params)
+        label = {"off": "Repeat off.", "track": "Repeating this track.",
+                 "context": "Repeating the playlist."}[mode]
+        return self._result(status, label, body)
+
+    # ---- seek -----------------------------------------------------------
+    async def seek(self, position_ms: int) -> dict:
+        position_ms = max(0, int(position_ms))
+        dev = await self._target_device()
+        params = {"position_ms": position_ms}
+        if dev:
+            params["device_id"] = dev
+        status, body = await self._api("PUT", "/me/player/seek", params=params)
+        label = "Back to the start." if position_ms == 0 else "Jumped."
+        return self._result(status, label, body)
+
+    async def seek_relative(self, delta_ms: int) -> dict:
+        status, body = await self._api("GET", "/me/player")
+        if status is None:
+            return {"ok": False, "needs_auth": True, "message": "Spotify isn't linked yet."}
+        if status != 200:
+            return {"ok": False, "message": "I can't read the current position right now."}
+        progress = body.get("progress_ms") or 0
+        duration = (body.get("item") or {}).get("duration_ms")
+        target = progress + delta_ms
+        if duration is not None:
+            target = min(target, duration)
+        return await self.seek(max(0, target))
+
+    # ---- queue ----------------------------------------------------------
+    async def add_to_queue(self, uri: str, label: str = "Added to your queue.") -> dict:
+        # Spotify's queue endpoint takes a single track/episode URI (no context)
+        # and only appends — there's no true "play next"/insert-at-front API.
+        if not uri:
+            return {"ok": False, "message": "There's nothing to queue."}
+        dev = await self._target_device()
+        params = {"uri": uri}
+        if dev:
+            params["device_id"] = dev
+        status, body = await self._api("POST", "/me/player/queue", params=params)
+        return self._result(status, label, body)
+
+    async def queue_search(self, query: str, kind: str = "track") -> dict:
+        status, body = await self._api("GET", "/search",
+                                       params={"q": query, "type": "track", "limit": 5})
+        if status != 200:
+            return self._result(status, "", body)
+        items = (body.get("tracks") or {}).get("items", [])
+        if not items:
+            return {"ok": False, "message": f"I couldn't find '{query}' on Spotify."}
+        item = self._pick_best(items, query, "track")
+        artist = ", ".join(a["name"] for a in item.get("artists", []))
+        label = f"Queued {item.get('name', 'that')}" + (f" by {artist}." if artist else ".")
+        return await self.add_to_queue(item["uri"], label)
+
     # ---- search & play --------------------------------------------------
-    async def search_and_play(self, query: str, kind: str = "track") -> dict:
+    @staticmethod
+    def _pick_best(items: list[dict], query: str, kind: str) -> dict:
+        """Choose the closest match instead of blindly taking the first result:
+        exact name, then prefix, then (for tracks) most popular, else first."""
+        q = query.strip().lower()
+        exact = [it for it in items if (it.get("name") or "").lower() == q]
+        if exact:
+            if kind == "track":
+                return max(exact, key=lambda it: it.get("popularity", 0))
+            return exact[0]
+        prefix = [it for it in items if (it.get("name") or "").lower().startswith(q)]
+        if prefix:
+            return prefix[0]
+        return items[0]
+
+    async def search_and_play(self, query: str, kind: str = "track",
+                              shuffle: bool = False) -> dict:
         kind = kind if kind in ("track", "album", "artist", "playlist") else "track"
         status, body = await self._api("GET", "/search",
-                                       params={"q": query, "type": kind, "limit": 1})
+                                       params={"q": query, "type": kind, "limit": 5})
         if status != 200:
             return self._result(status, "", body)
         items = (body.get(kind + "s") or {}).get("items", [])
         if not items:
             return {"ok": False, "message": f"I couldn't find a {kind} for '{query}' on Spotify."}
-        item = items[0]
+        item = self._pick_best(items, query, kind)
+        # For a context (album/artist/playlist), set shuffle first so it starts shuffled.
+        if shuffle and kind != "track":
+            await self.set_shuffle(True)
         dev = await self._target_device()
         params = {"device_id": dev} if dev else None
         payload = {"uris": [item["uri"]]} if kind == "track" else {"context_uri": item["uri"]}
@@ -266,7 +384,7 @@ class SpotifyWeb:
         return res
 
     # ---- liked / saved songs --------------------------------------------
-    async def play_liked(self) -> dict:
+    async def play_liked(self, shuffle: bool = False) -> dict:
         """Play the user's Liked Songs. These are saved tracks, not a real
         playlist, so there's no searchable URI — we fetch them and play the URIs."""
         status, body = await self._api("GET", "/me/tracks", params={"limit": 50})
@@ -278,11 +396,14 @@ class SpotifyWeb:
                 if it.get("track") and it["track"].get("uri")]
         if not uris:
             return {"ok": False, "message": "You don't have any Liked Songs yet."}
+        if shuffle:
+            random.shuffle(uris)
         dev = await self._target_device()
         params = {"device_id": dev} if dev else None
         st, b = await self._api("PUT", "/me/player/play", params=params,
                                 json_body={"uris": uris})
-        return self._result(st, "Playing your Liked Songs.", b)
+        msg = "Shuffling your Liked Songs." if shuffle else "Playing your Liked Songs."
+        return self._result(st, msg, b)
 
     # ---- now playing ----------------------------------------------------
     async def now_playing(self) -> dict:
@@ -315,6 +436,7 @@ class SpotifyWeb:
             "duration_ms": item.get("duration_ms"),
             "progress_ms": progress_ms,
             "url": (item.get("external_urls") or {}).get("spotify", ""),
+            "uri": item.get("uri", ""),
         }
 
     @staticmethod

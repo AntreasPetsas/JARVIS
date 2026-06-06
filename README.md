@@ -108,6 +108,16 @@ Set `llm.provider: anthropic` or `openai` in `config.yaml`, then add the matchin
 
 With `llm.tools: true` (default), the model can pick skills itself for phrasings the keyword rules miss — e.g. *"should I take a jacket?"* checks weather; *"any gaming news?"* pulls your hobby feed. Requires a tool-capable model (llama3.1+, qwen2.5, gpt-4o, claude-*). Disable with `llm.tools: false` for plain chat fallback.
 
+### General conversation & memory
+
+Anything that isn't a skill request is answered as plain conversation, and Jarvis keeps a short rolling memory so it can hold a multi-turn chat (typed and voice share the same memory). Tune the depth with `llm.history_turns` (default `6` exchanges).
+
+> **Known limitations** — worth knowing before you fork/extend:
+> - **Quality scales with the model.** On small models like `llama3.2:3b`, conversational recall and reasoning are unreliable (it may forget or confuse facts you just gave it). The memory plumbing is correct — the weak link is the model. `qwen2.5:7b-instruct` or any 7B+ / cloud model is markedly better. This is the single biggest quality lever.
+> - **Memory is in-process only.** It lives in RAM and resets every time you restart the server — conversations do not persist to disk across runs.
+> - **No long-term summarization.** History is a hard cap of `llm.history_turns`; older turns are simply dropped, not condensed. Long sessions lose their earliest context.
+> - **Tool routing is a heuristic.** A skill request phrased without any recognizable keyword (e.g. no weather/music/reminder words) may be answered as chat instead of triggering the skill. Extend the keyword rules / hint regex in `router.py` if you hit such a case.
+
 ---
 
 ## Spotify Web API (optional)

@@ -77,7 +77,7 @@ TOOL_HINT_RE = re.compile(
     r"cloud|degrees|pour|drizzle|chilly|freezing|outside|"
     r"news|headlines?|stor(?:y|ies)|article|happening|"
     r"play|pause|resume|skip|song|track|album|artist|playlist|music|spotify|volume|"
-    r"louder|quieter|mute|tune|"
+    r"louder|quieter|mute|tune|shuffle|repeat|loop|queue|devices?|"
     r"remind|reminders?|tasks?|to-?dos?|remember|forget|"
     r"brief|briefing|catch me up|update me)\b",
     re.IGNORECASE,
@@ -103,7 +103,8 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
 
     # --- Spotify / music ---
     if ("spotify" in low or "music" in low
-            or re.search(r"\b(play|pause|resume|stop|skip|track|song|playlist|volume|louder|quieter|mute|unmute)\b", low)
+            or re.search(r"\b(play|pause|resume|stop|skip|track|song|playlist|volume|louder|"
+                         r"quieter|mute|unmute|shuffle|repeat|loop|queue|devices?)\b", low)
             or re.search(r"what'?s playing|now playing", low)):
         await _spotify(cfg, t, low, send, history)
         return
@@ -250,6 +251,60 @@ async def _spotify(cfg: Config, t: str, low: str, send: Send, history: History) 
         await say(cfg, send, history, res["message"])
         return
 
+    # List available devices.
+    if re.search(r"\b(devices?)\b", low) and re.search(r"\b(what|which|list|show|available|any)\b", low):
+        if not use_api:
+            await say(cfg, send, history, _link_hint(web, "Device control"))
+            return
+        await say(cfg, send, history, (await web.list_devices())["message"])
+        return
+
+    # Transfer playback to a named device ("play on my phone", "switch to the kitchen").
+    # Only treat as a transfer when the tail actually names a known device — otherwise
+    # fall through so "switch to <playlist>" / "play <song>" still work.
+    if use_api:
+        tm = re.search(r"\b(?:play|switch|transfer|move|cast|continue)\b\s+(?:playback\s+)?"
+                       r"(?:on|to)\s+(?:my\s+|the\s+)?(.+)", low)
+        if tm:
+            cand = tm.group(1).strip(" .?!,'\"")
+            devices = await web._devices()
+            match = next((d for d in devices
+                          if cand in d.get("name", "").lower()
+                          or d.get("name", "").lower() in cand), None)
+            if match:
+                res = await web.transfer_to(match.get("name", ""))
+                await _spotify_done(cfg, send, history, web, use_api, res)
+                return
+
+    # Seek / restart / skip ahead — BEFORE next/skip so "skip ahead 30s" isn't a track skip.
+    sk = _seek_request(low)
+    if sk is not None:
+        if not use_api:
+            await say(cfg, send, history, _link_hint(web, "Seeking"))
+            return
+        mode, ms = sk
+        res = await web.seek(ms) if mode == "abs" else await web.seek_relative(ms)
+        await _spotify_done(cfg, send, history, web, use_api, res)
+        return
+
+    # Queue ("queue up X", "add this to the queue", "play next") — BEFORE the play parser
+    # because "play next" contains "play".
+    qm = re.search(r"\b(?:add\s+(?:this\s+)?(?:to\s+(?:the\s+)?)?queue|queue\s+up|queue|"
+                   r"play\s+next|up\s+next)\b\s*(.*)", t, re.IGNORECASE)
+    if qm:
+        if not use_api:
+            await say(cfg, send, history, _link_hint(web, "The queue"))
+            return
+        target = qm.group(1).strip(" .?!,'\"")
+        if target:
+            res = await web.queue_search(target)
+        else:  # no target -> queue the currently playing track
+            np = await web.now_playing()
+            res = await web.add_to_queue(np.get("uri", "")) if np.get("uri") else \
+                {"ok": False, "message": "There's nothing playing to queue."}
+        await say(cfg, send, history, res["message"])
+        return
+
     # Skip / previous.
     if re.search(r"\b(next|skip)\b", low):
         res = await web.next() if use_api else spotify.next_track()
@@ -260,13 +315,45 @@ async def _spotify(cfg: Config, t: str, low: str, send: Send, history: History) 
         await _spotify_done(cfg, send, history, web, use_api, res)
         return
 
-    # Play something specific ("play X", "put on Y", "listen to Z").
+    # Play something specific ("play X", "put on Y", "shuffle Z").
     query, kind = _parse_play_query(t)
     if query:
         if not use_api:
             await say(cfg, send, history, _link_hint(web, "Playing a specific track"))
             return
-        res = await web.play_liked() if _is_liked_songs(query) else await web.search_and_play(query, kind)
+        shuffle = bool(re.search(r"\bshuffle\b", low))
+        if _is_liked_songs(query):
+            res = await web.play_liked(shuffle=shuffle)
+        else:
+            # "shuffle X" with no explicit kind implies a playlist, not a single track.
+            if shuffle and kind == "track" and not re.search(r"\b(song|track)\b", low):
+                kind = "playlist"
+            res = await web.search_and_play(query, kind, shuffle=shuffle)
+        await _spotify_done(cfg, send, history, web, use_api, res)
+        return
+
+    # Shuffle on/off (no specific target).
+    if re.search(r"\bshuffle\b", low):
+        if not use_api:
+            await say(cfg, send, history, _link_hint(web, "Shuffle"))
+            return
+        on = not re.search(r"\b(off|stop|disable|no|don'?t)\b", low)
+        res = await web.set_shuffle(on)
+        await _spotify_done(cfg, send, history, web, use_api, res)
+        return
+
+    # Repeat / loop.
+    if re.search(r"\b(repeat|loop)\b", low):
+        if not use_api:
+            await say(cfg, send, history, _link_hint(web, "Repeat"))
+            return
+        if re.search(r"\b(off|stop|disable|no|don'?t)\b", low):
+            mode = "off"
+        elif re.search(r"\b(this|song|track|one)\b", low):
+            mode = "track"
+        else:
+            mode = "context"
+        res = await web.set_repeat(mode)
         await _spotify_done(cfg, send, history, web, use_api, res)
         return
 
@@ -313,6 +400,22 @@ def _volume_request(low: str):
     return None
 
 
+def _seek_request(low: str):
+    """Return ('abs', ms) | ('rel', delta_ms) | None from a seek phrase."""
+    if re.search(r"\b(restart|start over|start again|from the (?:top|beginning|start)|replay|"
+                 r"back to the (?:top|start|beginning))\b", low):
+        return ("abs", 0)
+    m = re.search(r"\b(skip|jump|fast.?forward|forward|rewind|go back|back|ahead)\b"
+                  r"[^0-9]*(\d{1,3})\s*(seconds?|secs?|s|minutes?|mins?|m)\b", low)
+    if m:
+        n = int(m.group(2))
+        unit = m.group(3)
+        ms = n * (60000 if unit.startswith("m") else 1000)
+        backward = bool(re.search(r"\b(rewind|go back|back)\b", low))
+        return ("rel", -ms if backward else ms)
+    return None
+
+
 def _is_liked_songs(q: str) -> bool:
     """Spotify's Liked Songs / saved library — has no searchable playlist URI."""
     low = q.strip().strip("'\"").lower()
@@ -322,7 +425,7 @@ def _is_liked_songs(q: str) -> bool:
 
 def _parse_play_query(text: str):
     """Pull a search target out of 'play ...' / 'put on ...' / 'change ... to ...'. Returns (query, kind)."""
-    m = re.search(r"\b(?:play|put on|listen to)\b\s+(.+)", text, re.IGNORECASE)
+    m = re.search(r"\b(?:play|put on|listen to|shuffle)\b\s+(.+)", text, re.IGNORECASE)
     if not m:
         # "change/switch [the] [playlist/album/artist] to X"
         cm = re.search(r"\b(?:change|switch)\b(.{0,40}?)\bto\s+(.+)", text, re.IGNORECASE)
@@ -345,7 +448,10 @@ def _parse_play_query(text: str):
         kind = {"song": "track", "track": "track"}.get(mk.group(1).lower(), mk.group(1).lower())
         q = mk.group(2)
     q = re.sub(r"^(?:me\s+|some\s+|a\s+|the\s+)+", "", q, flags=re.IGNORECASE).strip(" .?!,")
-    if q.lower() in ("", "music", "something", "a song", "spotify", "anything"):
+    # Control words ("shuffle off", "shuffle on") aren't play targets — let the
+    # dedicated shuffle/repeat toggle branches handle them.
+    if q.lower() in ("", "on", "off", "music", "my music", "some music", "something",
+                     "a song", "spotify", "anything", "it", "this"):
         return "", kind
     return q, kind
 
@@ -463,7 +569,11 @@ async def _run_spotify_tool(cfg: Config, send: Send, args: dict) -> str:
             return "What should I play?"
         if not use_api:
             return _link_hint(web, "Playing a specific track")
-        res = await web.play_liked() if _is_liked_songs(q) else await web.search_and_play(q)
+        shuffle = bool(args.get("shuffle"))
+        if _is_liked_songs(q):
+            res = await web.play_liked(shuffle=shuffle)
+        else:
+            res = await web.search_and_play(q, shuffle=shuffle)
         if res.get("ok"):
             np = await web.now_playing()
             if np.get("ok") and np.get("title"):
@@ -477,6 +587,57 @@ async def _run_spotify_tool(cfg: Config, send: Send, args: dict) -> str:
         if level is None:
             return "What volume level?"
         return (await web.set_volume(int(level))).get("message", "")
+
+    if action == "shuffle":
+        if not use_api:
+            return _link_hint(web, "Shuffle")
+        on = args.get("on")
+        return (await web.set_shuffle(True if on is None else bool(on))).get("message", "")
+
+    if action == "repeat":
+        if not use_api:
+            return _link_hint(web, "Repeat")
+        return (await web.set_repeat((args.get("mode") or "context").lower())).get("message", "")
+
+    if action == "seek":
+        if not use_api:
+            return _link_hint(web, "Seeking")
+        if args.get("position_seconds") is not None:
+            res = await web.seek(int(args["position_seconds"]) * 1000)
+        elif args.get("delta_seconds") is not None:
+            res = await web.seek_relative(int(args["delta_seconds"]) * 1000)
+        else:
+            return "Where should I seek to?"
+        return res.get("message", "")
+
+    if action in ("queue", "play_next"):
+        if not use_api:
+            return _link_hint(web, "The queue")
+        q = (args.get("query") or "").strip()
+        if q:
+            return (await web.queue_search(q)).get("message", "")
+        np = await web.now_playing()
+        if not np.get("uri"):
+            return "There's nothing playing to queue."
+        return (await web.add_to_queue(np["uri"])).get("message", "")
+
+    if action == "list_devices":
+        if not use_api:
+            return _link_hint(web, "Device control")
+        return (await web.list_devices()).get("message", "")
+
+    if action == "transfer":
+        if not use_api:
+            return _link_hint(web, "Device control")
+        device = (args.get("device") or "").strip()
+        if not device:
+            return "Which device should I switch to?"
+        res = await web.transfer_to(device)
+        if res.get("ok"):
+            np = await web.now_playing()
+            if np.get("ok") and np.get("title"):
+                await send({"type": "panel", "panel": "nowplaying", "data": np})
+        return res.get("message", "")
 
     if action in ("next", "previous", "pause", "play"):
         if use_api:

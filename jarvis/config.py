@@ -29,6 +29,11 @@ _DEFAULTS: dict[str, Any] = {
         "max_tokens": 500,
         "tools": True,  # let the model pick skills itself (tool-calling) for off-keyword requests
         "history_turns": 6,  # rolling conversation memory: how many user/assistant exchanges to keep
+        "persist_history": True,  # save the conversation to data/history.jsonl so it survives restarts
+    },
+    "memory": {
+        "profile": True,     # keep an editable profile (data/profile.md) Jarvis uses to personalise
+        "interview": [],     # custom "get to know me" questions [{key, q}, ...]; empty = built-in set
     },
     "news": {
         "software": {

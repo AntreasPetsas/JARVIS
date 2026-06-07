@@ -110,13 +110,34 @@ With `llm.tools: true` (default), the model can pick skills itself for phrasings
 
 ### General conversation & memory
 
-Anything that isn't a skill request is answered as plain conversation, and Jarvis keeps a short rolling memory so it can hold a multi-turn chat (typed and voice share the same memory). Tune the depth with `llm.history_turns` (default `6` exchanges).
+Anything that isn't a skill request is answered as plain conversation, and Jarvis keeps a short rolling memory so it can hold a multi-turn chat (typed and voice share the same memory). Tune the depth with `llm.history_turns` (default `6` exchanges). The conversation is also saved to disk so it survives restarts — see [Memory](#memory--a-jarvis-that-knows-you) below.
 
 > **Known limitations** — worth knowing before you fork/extend:
 > - **Quality scales with the model.** On small models like `llama3.2:3b`, conversational recall and reasoning are unreliable (it may forget or confuse facts you just gave it). The memory plumbing is correct — the weak link is the model. `qwen2.5:7b-instruct` or any 7B+ / cloud model is markedly better. This is the single biggest quality lever.
-> - **Memory is in-process only.** It lives in RAM and resets every time you restart the server — conversations do not persist to disk across runs.
-> - **No long-term summarization.** History is a hard cap of `llm.history_turns`; older turns are simply dropped, not condensed. Long sessions lose their earliest context.
+> - **No long-term summarization.** Only the last `llm.history_turns` exchanges are fed back into the prompt; older turns are archived to `data/history.jsonl` (and stay keyword-searchable) but are *not* condensed into the model's context. Long sessions still lose their earliest context from the live prompt.
 > - **Tool routing is a heuristic.** A skill request phrased without any recognizable keyword (e.g. no weather/music/reminder words) may be answered as chat instead of triggering the skill. Extend the keyword rules / hint regex in `router.py` if you hit such a case.
+
+### Memory — a Jarvis that knows you
+
+Jarvis keeps two kinds of memory on disk, both under `jarvis/data/` (which is git-ignored, so nothing personal is ever committed):
+
+- **Conversation history** → `data/history.jsonl`, an append-only log so chats survive a restart and stay keyword-searchable. Toggle with `llm.persist_history` (default `true`).
+- **A profile of you** → `data/profile.md`, a plain Markdown file of durable facts Jarvis injects into its replies so they're personalised. **You can open and edit it by hand** at any time. Toggle with `memory.profile` (default `true`).
+
+Fill the profile with a quick guided interview, or just tell Jarvis things as you go:
+
+```
+start getting to know me        → a short Q&A that fills your profile (say "skip" or "stop" any time)
+remember that I prefer tea      → store a free-form fact
+remember my timezone is GMT     → store a "my X is Y" fact
+change my name to Tony          → update a fact you've already given me
+what do you know about me       → read your profile back
+forget this conversation        → wipe the saved chat history (your profile is kept — Jarvis never forgets you)
+```
+
+Customise the interview questions with `memory.interview` in `config.yaml` (a list of `{ key, q }`); leave it empty for the built-in set.
+
+> **Why JSONL + Markdown, not a database?** The access pattern (append per turn, load recent on startup, occasional keyword search) is small and human-scale, so plain files keep memory transparent, editable, and dependency-free. If you ever need heavy full-text search, swap the conversation store for SQLite + FTS5; for *semantic* recall, a vector store. Both sit behind the small `ConversationStore` interface in `jarvis/memory_store.py`, so nothing else has to change.
 
 ---
 

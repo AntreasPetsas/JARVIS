@@ -12,12 +12,15 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Config, load_config
+from .memory_store import JsonlStore
 from .router import History, handle, say
 from .skills import reminders
 from .skills.briefing import spoken_briefing
+from .skills.onboarding import InterviewState
 from .skills.spotify_api import get_spotify
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _spotify_page(title: str, body: str) -> str:
@@ -55,7 +58,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or load_config()
     hub = Hub()
     # One shared conversation memory so typed and voice input share a single brain.
-    history = History(cfg.get("llm.history_turns", 6))
+    # Persist it to disk (data/history.jsonl) so it survives restarts, unless disabled.
+    store = JsonlStore(DATA_DIR / "history.jsonl") if cfg.get("llm.persist_history", True) else None
+    history = History(cfg.get("llm.history_turns", 6), store=store)
+    # Shared "get to know me" interview progress (typed + voice drive the same one).
+    interview = InterviewState()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -68,7 +75,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 loop = asyncio.get_running_loop()
 
                 async def on_command(text: str) -> None:
-                    await handle(cfg, text, hub.broadcast, history)
+                    await handle(cfg, text, hub.broadcast, history, interview)
 
                 va = VoiceAssistant(cfg, loop, hub.broadcast, on_command)
                 va.start()
@@ -153,7 +160,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 mtype = msg.get("type")
                 if mtype == "command":
                     await cancel_briefing()
-                    asyncio.create_task(handle(cfg, msg.get("text", ""), send, history))
+                    asyncio.create_task(handle(cfg, msg.get("text", ""), send, history, interview))
                 elif mtype == "briefing":
                     await cancel_briefing()
                     briefing_task = asyncio.create_task(_run_briefing(cfg, send, history))

@@ -13,8 +13,10 @@ from typing import Awaitable, Callable
 
 from .config import Config
 from .llm import TOOLS, get_llm
-from .skills import news, reminders, spotify, weather
+from .memory_store import ConversationStore
+from .skills import news, onboarding, profile, reminders, spotify, weather
 from .skills.briefing import spoken_briefing
+from .skills.onboarding import InterviewState
 from .skills.spotify_api import get_spotify
 
 Send = Callable[[dict], Awaitable[None]]
@@ -26,18 +28,37 @@ class History:
     Holds the last `turns` exchanges as provider-neutral {role, content} messages,
     so it can be handed straight to `LLMProvider.chat()`. Capped so a long session
     never blows the context window of a small local model.
+
+    When a `store` is supplied the window is also persisted (and preloaded on start)
+    so the conversation survives a restart. Without one it stays purely in-memory.
     """
 
-    def __init__(self, turns: int = 6):
+    def __init__(self, turns: int = 6, store: ConversationStore | None = None):
         self._msgs: deque[dict] = deque(maxlen=max(1, turns) * 2)
+        self._store = store
+        if store is not None:
+            for rec in store.recent(self._msgs.maxlen):
+                role, content = rec.get("role"), (rec.get("content") or "").strip()
+                if role and content:
+                    self._msgs.append({"role": role, "content": content})
 
     def add(self, role: str, text: str) -> None:
         text = (text or "").strip()
         if text:
             self._msgs.append({"role": role, "content": text})
+            if self._store is not None:
+                self._store.append(role, text)
 
     def messages(self) -> list[dict]:
         return list(self._msgs)
+
+    def clear(self) -> None:
+        self._msgs.clear()
+        if self._store is not None:
+            self._store.clear()
+
+    def search(self, query: str, limit: int = 10) -> list[dict]:
+        return self._store.search(query, limit) if self._store is not None else []
 
 CHAT_SYSTEM = (
     "You are Jarvis, a concise, witty British AI butler for a software engineer. "
@@ -124,8 +145,30 @@ TOOL_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "remember/note that I ..." — a durable fact about the *user* (identity/preferences),
+# distinct from "remember to <do something>", which is a reminder. The verb whitelist
+# keeps tasky phrasings ("remember that I need to call mum") out, so they fall through
+# to the reminders skill unchanged.
+REMEMBER_FACT_RE = re.compile(
+    r"\b(?:remember|note)\s+(?:that\s+)?"
+    r"(?P<body>my\s+.+|i\s*'?\s*(?:m|am|like|love|enjoy|prefer|hate|live|work|study|"
+    r"drink|speak|use|own|drive|play|support|was born)\b.*)",
+    re.IGNORECASE,
+)
 
-async def handle(cfg: Config, text: str, send: Send, history: History | None = None) -> None:
+# Update / correct a known fact: "change my name to Tony", "update my role to CTO".
+UPDATE_FACT_RE = re.compile(
+    r"\b(?:update|change|set|correct|fix)\s+my\s+(?P<k>.+?)\s+(?:to|is|are|=|:|as)\s+(?P<v>.+)",
+    re.IGNORECASE,
+)
+# Music-domain "keys" aren't profile facts — let the Spotify skill handle e.g.
+# "change my playlist to jazz" / "set my volume to 50".
+_MUSIC_KEY_RE = re.compile(r"\b(song|track|album|artist|playlist|music|volume|tune|queue)\b",
+                           re.IGNORECASE)
+
+
+async def handle(cfg: Config, text: str, send: Send, history: History | None = None,
+                 interview: InterviewState | None = None) -> None:
     t = text.strip()
     if not t:
         return
@@ -133,6 +176,19 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
     low = t.lower()
     await send({"type": "transcript", "role": "user", "text": t})
     history.add("user", t)
+
+    # --- Personal memory: an interview in progress, the command to start one, or a
+    #     direct memory command. Checked first so an answer like "I love Spotify"
+    #     is captured, not mis-routed to the music skill. ---
+    if cfg.get("memory.profile", True):
+        if interview is not None and interview.active:
+            await _interview_step(cfg, t, send, history, interview)
+            return
+        if interview is not None and onboarding.is_start(t):
+            await _interview_start(cfg, send, history, interview)
+            return
+        if await _memory_command(cfg, t, low, send, history):
+            return
 
     # --- Daily briefing ---
     if re.search(r"\b(brief|briefing|catch me up|what'?s going on|update me)\b", low):
@@ -241,8 +297,9 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
         await _agent(cfg, t, send, history)
         return
     try:
-        result = await llm.chat([{"role": "system", "content": CHAT_SYSTEM}, *history.messages()],
-                                max_tokens=cfg.get("llm.max_tokens", 500))
+        result = await llm.chat(
+            [{"role": "system", "content": _system_with_profile(cfg, CHAT_SYSTEM)}, *history.messages()],
+            max_tokens=cfg.get("llm.max_tokens", 500))
         reply = result.get("text", "").strip()
     except Exception:  # noqa: BLE001
         reply = "I reached the model but the request failed — check the Ollama window for errors."
@@ -569,7 +626,7 @@ async def _agent(cfg: Config, t: str, send: Send, history: History) -> None:
     max_tokens = cfg.get("llm.max_tokens", 500)
     try:
         result = await llm.chat(
-            [{"role": "system", "content": AGENT_SYSTEM}, *history.messages()],
+            [{"role": "system", "content": _system_with_profile(cfg, AGENT_SYSTEM)}, *history.messages()],
             tools=TOOLS, max_tokens=max_tokens)
     except Exception:  # noqa: BLE001
         result = {"text": "", "tool_calls": []}
@@ -580,8 +637,9 @@ async def _agent(cfg: Config, t: str, send: Send, history: History) -> None:
         reply = result.get("text", "").strip()
         if not reply:
             try:
-                chat = await llm.chat([{"role": "system", "content": CHAT_SYSTEM}, *history.messages()],
-                                      max_tokens=max_tokens)
+                chat = await llm.chat(
+                    [{"role": "system", "content": _system_with_profile(cfg, CHAT_SYSTEM)},
+                     *history.messages()], max_tokens=max_tokens)
                 reply = chat.get("text", "").strip()
             except Exception:  # noqa: BLE001
                 reply = ""
@@ -801,3 +859,138 @@ async def _push_panels(data: dict, send: Send) -> None:
     await send({"type": "panel", "panel": "software_news", "data": data.get("software_news", [])})
     await send({"type": "panel", "panel": "hobby_news", "data": data.get("hobby_news", [])})
     await send({"type": "panel", "panel": "reminders", "data": data.get("reminders", [])})
+
+
+# --- Personal memory: profile injection, quick-capture, and the interview ----------
+
+def _system_with_profile(cfg: Config, base: str) -> str:
+    """Append the user's profile to a system prompt so replies are personalised."""
+    if not cfg.get("memory.profile", True):
+        return base
+    text = profile.profile_text()
+    if not text:
+        return base
+    return (base + "\n\nWhat you know about the user (use it naturally; don't recite "
+            "it back unless asked):\n" + text)
+
+
+async def _memory_command(cfg: Config, t: str, low: str, send: Send, history: History) -> bool:
+    """Handle direct profile/memory commands. Returns True if one matched.
+
+    Note: there is deliberately no "forget the profile" command — Jarvis never forgets
+    *you*. Facts can only be added or changed, and you can always edit data/profile.md
+    by hand.
+    """
+    # Update / correct a known fact ("change my name to Tony"). Music keys fall through
+    # to the Spotify skill ("change my playlist to jazz").
+    um = UPDATE_FACT_RE.search(t)
+    if um:
+        key, val = um.group("k").strip(), um.group("v").strip(" .")
+        if key and val and not _MUSIC_KEY_RE.search(key):
+            profile.set_fact(key.title(), val)
+            await say(cfg, send, history, f"Updated — your {key.lower()} is now {val}.")
+            return True
+
+    # Quick fact capture — runs before the reminders skill (see REMEMBER_FACT_RE).
+    m = REMEMBER_FACT_RE.search(t)
+    if m:
+        body = m.group("body").strip(" .")
+        kv = re.match(r"my\s+(?P<k>.+?)\s+(?:is|are|=|:)\s+(?P<v>.+)", body, re.IGNORECASE)
+        if kv and not _MUSIC_KEY_RE.search(kv.group("k")):
+            key, val = kv.group("k").strip(), kv.group("v").strip(" .")
+            profile.set_fact(key.title(), val)
+            await say(cfg, send, history, f"Noted — your {key.lower()} is {val}.")
+        else:
+            profile.add_note(body)
+            await say(cfg, send, history, "Noted. I'll keep that in mind.")
+        return True
+
+    # Read the profile back.
+    if re.search(r"what do you know about me|what'?s in my profile|"
+                 r"what do you remember about me|who am i to you", low):
+        fx = profile.facts()
+        if fx:
+            await say(cfg, send, history, "Here's what I know about you — "
+                      + "; ".join(f"{k}: {v}" for k, v in fx.items()) + ".")
+        elif profile.profile_text():
+            await say(cfg, send, history, "I've jotted down: " + profile.profile_text())
+        else:
+            await say(cfg, send, history, "Honestly, not much yet, sir. Say "
+                      "'start getting to know me' and I'll fix that.")
+        return True
+
+    # Clear the *conversation* log only — never the profile. Kept explicit so it can't
+    # fire on casual phrasing.
+    if re.search(r"forget (?:this|our) (?:conversation|chat)|"
+                 r"(?:clear|wipe|erase|reset) (?:the |our )?(?:history|conversation|chat)", low):
+        history.clear()
+        await say(cfg, send, history, "Conversation wiped — though I still remember you, sir.")
+        return True
+
+    return False
+
+
+async def _interview_start(cfg: Config, send: Send, history: History,
+                           interview: InterviewState) -> None:
+    interview.questions = onboarding.load_questions(cfg)
+    interview.active = True
+    interview.index = 0
+    interview.answered = 0
+    try:  # decide once whether we can LLM-tidy answers, to avoid a check per question
+        interview.clean = await get_llm(cfg).available()
+    except Exception:  # noqa: BLE001
+        interview.clean = False
+    intro = ("Splendid. A few quick questions so I can get to know you — say 'skip' to "
+             "pass on any, or 'stop' to finish early. First: ")
+    await say(cfg, send, history, intro + interview.questions[0]["q"])
+
+
+async def _interview_step(cfg: Config, t: str, send: Send, history: History,
+                          interview: InterviewState) -> None:
+    if onboarding.is_stop(t):
+        answered = interview.answered
+        interview.reset()
+        await say(cfg, send, history, "No problem — I've saved what we covered." if answered
+                  else "All right, we'll leave it there.")
+        return
+
+    q = interview.current()
+    if q is None:  # safety: state somehow out of range
+        interview.reset()
+        return
+    if not onboarding.is_skip(t):
+        value = await _clean_answer(cfg, q, t, interview.clean)
+        if value:
+            profile.set_fact(q["key"], value)
+            interview.answered += 1
+
+    interview.index += 1
+    nxt = interview.current()
+    if nxt is None:
+        answered = interview.answered
+        interview.reset()
+        await say(cfg, send, history,
+                  "That's everything — thank you. I'll keep all that in mind from now on."
+                  if answered else "All done. We can try again any time with "
+                  "'start getting to know me'.")
+        return
+    await say(cfg, send, history, nxt["q"])
+
+
+async def _clean_answer(cfg: Config, question: dict, answer: str, use_llm: bool) -> str:
+    """Tidy a spoken answer into a concise profile value; fall back to the raw text."""
+    raw = (answer or "").strip().strip(".")
+    if not raw or not use_llm:
+        return raw
+    try:
+        sys = ("Extract the concise answer to the question as a short profile value. "
+               "Reply with ONLY the value — no preamble, no punctuation, no quotes. "
+               "If there's no clear answer, echo the user's words.")
+        out = (await get_llm(cfg).complete(
+            sys, f"Question: {question['q']}\nUser said: {raw}\nValue:", 40)).strip()
+        out = out.strip('"').strip()
+        if out and "\n" not in out and len(out) <= 80:
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    return raw

@@ -131,7 +131,12 @@
   }
 
   // ---------- High-quality voice (edge-tts) playback + live waveform ----------
-  let audioCtx = null, analyser = null, freqData = null, audioPlaying = false;
+  let audioCtx = null, analyser = null, freqData = null, audioPlaying = false, currentSrc = null;
+  function stopAudio() {
+    if (currentSrc) { try { currentSrc.stop(); } catch (_) {} currentSrc = null; }
+    if (synth) synth.cancel();
+    audioPlaying = false; voiceLevel = null; setState("idle");
+  }
   function ensureAudio() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -152,12 +157,14 @@
     const buf = await audioCtx.decodeAudioData(bytes.buffer);
     const src = audioCtx.createBufferSource();
     src.buffer = buf; src.connect(analyser);
+    currentSrc = src;
     setState("speaking"); audioPlaying = true;
     send({ type: "speaking", on: true, seconds: buf.duration }); // pause wake word so we don't hear ourselves
     let finished = false;
     const finish = () => {
       if (finished) return;
       finished = true;
+      if (currentSrc === src) currentSrc = null;
       audioPlaying = false; voiceLevel = null; setState("idle");
       send({ type: "speaking", on: false });
     };
@@ -257,6 +264,7 @@
           if (m.message) els.subtitle.textContent = m.message;
           if (m.ok === false && m.error) console.warn("voice:", m.error);
           break;
+        case "stop_audio": stopAudio(); break;
         case "transcript": addLine(m.role, m.text); break;
         case "panel":
           if (m.panel === "weather") renderWeather(m.data);

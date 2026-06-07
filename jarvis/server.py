@@ -132,8 +132,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     "message": ("Voice online — say 'Hey Jarvis', or click the mic."
                                 if app.state.voice is not None else "Voice off — type below.")})
 
+        briefing_task: asyncio.Task | None = None
         if cfg.get("briefing.on_startup", True):
-            asyncio.create_task(_run_briefing(cfg, send, history))
+            briefing_task = asyncio.create_task(_run_briefing(cfg, send, history))
+
+        async def cancel_briefing() -> None:
+            nonlocal briefing_task
+            if briefing_task is not None and not briefing_task.done():
+                briefing_task.cancel()
+                await send({"type": "stop_audio"})
+            briefing_task = None
 
         try:
             while True:
@@ -144,9 +152,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     continue
                 mtype = msg.get("type")
                 if mtype == "command":
+                    await cancel_briefing()
                     asyncio.create_task(handle(cfg, msg.get("text", ""), send, history))
                 elif mtype == "briefing":
-                    asyncio.create_task(_run_briefing(cfg, send, history))
+                    await cancel_briefing()
+                    briefing_task = asyncio.create_task(_run_briefing(cfg, send, history))
                 elif mtype == "listen":
                     if app.state.voice is not None:
                         app.state.voice.trigger_listen()
@@ -173,11 +183,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
 
 async def _run_briefing(cfg: Config, send, history: History | None = None) -> None:
-    await send({"type": "state", "state": "thinking"})
-    result = await spoken_briefing(cfg)
-    data = result["data"]
-    await send({"type": "panel", "panel": "weather", "data": data.get("weather", {})})
-    await send({"type": "panel", "panel": "software_news", "data": data.get("software_news", [])})
-    await send({"type": "panel", "panel": "hobby_news", "data": data.get("hobby_news", [])})
-    await send({"type": "panel", "panel": "reminders", "data": data.get("reminders", [])})
-    await say(cfg, send, history, result["text"])  # edge-tts; HUD idles when playback ends
+    try:
+        await send({"type": "state", "state": "thinking"})
+        result = await spoken_briefing(cfg)
+        data = result["data"]
+        await send({"type": "panel", "panel": "weather", "data": data.get("weather", {})})
+        await send({"type": "panel", "panel": "software_news", "data": data.get("software_news", [])})
+        await send({"type": "panel", "panel": "hobby_news", "data": data.get("hobby_news", [])})
+        await send({"type": "panel", "panel": "reminders", "data": data.get("reminders", [])})
+        await say(cfg, send, history, result["text"])  # edge-tts; HUD idles when playback ends
+    except (WebSocketDisconnect, RuntimeError):
+        pass

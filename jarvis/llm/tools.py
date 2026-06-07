@@ -75,8 +75,17 @@ TOOLS: list[dict] = [
                 "query": {"type": "string",
                           "description": "What to play/queue, for action='search', 'queue', or "
                                          "'play_next'. Use 'liked songs' for the user's saved tracks."},
+                "kind": {"type": "string", "enum": ["track", "album", "artist", "playlist"],
+                         "description": "What to search for when action='search'. "
+                                        "Use 'playlist' for mood/genre/theme requests ('lo-fi music', "
+                                        "'gaming music', 'chill vibes'). Use 'artist' when the user names "
+                                        "a band or musician. Use 'album' for a specific album. "
+                                        "Use 'track' for a specific song. Defaults to 'track'."},
                 "level": {"type": "integer",
-                          "description": "Volume 0-100, when action='volume'."},
+                          "description": "Exact volume 0-100, when action='volume'."},
+                "direction": {"type": "string", "enum": ["up", "down"],
+                              "description": "Nudge volume up/down when action='volume' and no "
+                                             "exact level is given ('louder'→up, 'quieter'→down)."},
                 "on": {"type": "boolean",
                        "description": "Turn shuffle on (true) or off (false), when action='shuffle'."},
                 "mode": {"type": "string", "enum": ["off", "track", "context"],

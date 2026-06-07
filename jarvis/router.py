@@ -55,6 +55,47 @@ AGENT_NARRATE_SYSTEM = (
     "You are Jarvis, a concise, witty British AI butler. Turn the tool results into a "
     "short spoken reply of one or two sentences. No markdown, no lists."
 )
+# Used only inside handle() weather branch to extract city from the query.
+WEATHER_PARSE_SYSTEM = (
+    "You are a weather intent parser. The user asked about weather or temperature. "
+    "Call get_weather with the correct arguments. Rules:\n"
+    "- Extract the city name exactly as the user stated it. "
+    "Example: 'temperature in Nicosia' → city='Nicosia'.\n"
+    "- If no city is mentioned, omit the city field entirely.\n"
+    "Always call the tool. Never reply in plain text."
+)
+# Used only inside _spotify() to translate natural language → one structured tool
+# call. Kept narrow (one tool, no history) and example-driven so even a small local
+# model maps intent reliably. Every action the tool supports is covered here — a gap
+# makes a 3B model guess (e.g. it once mapped 'play on laptop' to pause).
+SPOTIFY_PARSE_SYSTEM = (
+    "You translate a music command into ONE control_spotify tool call. "
+    "Always call the tool; never reply with plain text.\n\n"
+    "Pick the action:\n"
+    "- play → resume/start when NO song, artist, or place is named "
+    "('play', 'play music', 'start music', 'resume', 'unpause').\n"
+    "- pause → 'pause', 'stop'.\n"
+    "- next → 'next', 'skip'.\n"
+    "- previous → 'previous', 'go back', 'last track', 'play the previous song'.\n"
+    "- search → play something specific. Set query to what they want and pick kind:\n"
+    "    kind=playlist for a mood/genre/activity ('gaming music', 'lo-fi', 'workout', 'jazz').\n"
+    "    kind=artist for a band or musician by name.\n"
+    "    kind=album for a named album.\n"
+    "    kind=track for one specific song. For saved/liked tracks use query='liked songs'.\n"
+    "- transfer → move playback to a device ('play on my laptop', 'play music on the laptop', "
+    "'switch to the kitchen', 'cast to phone'). Put ONLY the device name in device (e.g. 'laptop').\n"
+    "- volume → set exact level 0-100, OR direction 'up'/'down' for 'louder'/'quieter'/"
+    "'turn it up/down'. 'mute' = level 0.\n"
+    "- shuffle → on=true/false. repeat → mode=track/context/off. seek. list_devices.\n"
+    "- now_playing → 'what's playing', 'what song is this'.\n"
+    "- queue / play_next → ONLY when they literally say 'queue' or 'play next'.\n\n"
+    "Examples:\n"
+    "'play league of legends music' → search, query='league of legends', kind=playlist\n"
+    "'play the previous song' → previous\n"
+    "'play liked songs' → search, query='liked songs'\n"
+    "'play music on the laptop' → transfer, device='laptop'\n"
+    "'turn it up a bit' → volume, direction='up'\n"
+)
 
 # "add" phrasings — matched against the original text so casing is preserved.
 ADD_RE = re.compile(
@@ -112,14 +153,19 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
     # --- Weather ---
     if re.search(r"\b(weather|temperature|forecast|rain|cold|hot|sunny)\b", low):
         await send({"type": "state", "state": "thinking"})
+        llm = get_llm(cfg)
+        if cfg.get("llm.tools", True) and getattr(llm, "supports_tools", False):
+            if await _weather_llm(cfg, t, send, history, llm):
+                return
+        # Fallback: LLM unavailable or returned nothing — use configured home city.
         wx = await weather.get_weather(cfg.get("location.city", "London"),
                                        cfg.get("location.units", "metric"))
         await send({"type": "panel", "panel": "weather", "data": wx})
         if wx.get("ok"):
-            await say(cfg, send, history,f"It's {wx['temp']}{wx['unit']} and {wx['condition'].lower()} in "
+            await say(cfg, send, history, f"It's {wx['temp']}{wx['unit']} and {wx['condition'].lower()} in "
                              f"{wx['city']}, feels like {wx['feels_like']}{wx['unit']}.")
         else:
-            await say(cfg, send, history,wx.get("error", "I couldn't reach the weather service."))
+            await say(cfg, send, history, wx.get("error", "I couldn't reach the weather service."))
         return
 
     # --- Hobby news (checked before generic "news" so it isn't swallowed) ---
@@ -203,6 +249,58 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
     await say(cfg, send, history, reply or "I'm not sure how to help with that one, sir.")
 
 
+async def _weather_llm(cfg: Config, t: str, send: Send, history: History, llm) -> bool:
+    """Parse a weather query via LLM to extract the city. Returns True if handled."""
+    weather_tool = next((tool for tool in TOOLS if tool["name"] == "get_weather"), None)
+    if not weather_tool:
+        return False
+    try:
+        result = await llm.chat(
+            [{"role": "system", "content": WEATHER_PARSE_SYSTEM},
+             {"role": "user", "content": t}],
+            tools=[weather_tool],
+            max_tokens=100,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    calls = result.get("tool_calls") or []
+    if not calls:
+        return False
+    args = calls[0].get("arguments") or {}
+    out = await _run_tool(cfg, send, "get_weather", args)
+    await say(cfg, send, history, out)
+    return True
+
+
+async def _spotify_llm(cfg: Config, t: str, send: Send, history: History, llm) -> bool:
+    """Parse a music command via LLM tool-calling. Returns True if handled, False to fall back."""
+    spotify_tool = next((tool for tool in TOOLS if tool["name"] == "control_spotify"), None)
+    if not spotify_tool:
+        return False
+    try:
+        result = await llm.chat(
+            [{"role": "system", "content": SPOTIFY_PARSE_SYSTEM},
+             {"role": "user", "content": t}],
+            tools=[spotify_tool],
+            max_tokens=200,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    calls = result.get("tool_calls") or []
+    if not calls:
+        return False
+    args = calls[0].get("arguments") or {}
+    # Validate against the tool's own action enum. A small model sometimes invents an
+    # action ('switch_device'); rather than dead-end on "Unsupported music action.", we
+    # bail and let the deterministic regex chain below take the command.
+    valid = spotify_tool["parameters"]["properties"]["action"].get("enum", [])
+    if (args.get("action") or "").lower() not in valid:
+        return False
+    out = await _run_spotify_tool(cfg, send, args)
+    await say(cfg, send, history, out or "Done.")
+    return True
+
+
 async def _spotify(cfg: Config, t: str, low: str, send: Send, history: History) -> None:
     """Music control. Uses the Spotify Web API when linked; else Windows media keys."""
     web = get_spotify(cfg)
@@ -228,6 +326,15 @@ async def _spotify(cfg: Config, t: str, low: str, send: Send, history: History) 
         res = spotify.open_spotify(cfg.get("spotify.exe_path", ""))
         await say(cfg, send, history, res["message"])
         return
+
+    # LLM intent parsing — maps natural language to a structured control_spotify call.
+    # More reliable than regex for phrasing variations ("play previous song", "gaming music", etc.).
+    # Falls through to the regex chain below when the LLM is unavailable or returns nothing.
+    llm = get_llm(cfg)
+    if cfg.get("llm.tools", True) and getattr(llm, "supports_tools", False):
+        await send({"type": "state", "state": "thinking"})
+        if await _spotify_llm(cfg, t, send, history, llm):
+            return
 
     # What's playing?
     if re.search(r"what'?s playing|now playing|what (?:song|track)|which (?:song|track)|"
@@ -570,10 +677,13 @@ async def _run_spotify_tool(cfg: Config, send: Send, args: dict) -> str:
         if not use_api:
             return _link_hint(web, "Playing a specific track")
         shuffle = bool(args.get("shuffle"))
+        kind = (args.get("kind") or "track").lower()
+        if kind not in ("track", "album", "artist", "playlist"):
+            kind = "track"
         if _is_liked_songs(q):
             res = await web.play_liked(shuffle=shuffle)
         else:
-            res = await web.search_and_play(q, shuffle=shuffle)
+            res = await web.search_and_play(q, kind, shuffle=shuffle)
         if res.get("ok"):
             np = await web.now_playing()
             if np.get("ok") and np.get("title"):
@@ -584,9 +694,12 @@ async def _run_spotify_tool(cfg: Config, send: Send, args: dict) -> str:
         if not use_api:
             return _link_hint(web, "Volume control")
         level = args.get("level")
-        if level is None:
-            return "What volume level?"
-        return (await web.set_volume(int(level))).get("message", "")
+        if level is not None:
+            return (await web.set_volume(int(level))).get("message", "")
+        direction = (args.get("direction") or "").lower()
+        if direction in ("up", "down"):
+            return (await web.nudge_volume(15 if direction == "up" else -15)).get("message", "")
+        return "What volume level?"
 
     if action == "shuffle":
         if not use_api:

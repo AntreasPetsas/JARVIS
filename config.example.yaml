@@ -54,8 +54,21 @@ spotify:
   default_device: ""   # optional Spotify Connect device name to target (e.g. "DESKTOP-PC")
 
 briefing:
-  on_startup: true
+  on_startup: false   # don't brief automatically on launch; ask ("brief me") or hit Brief
   sections: ["greeting", "weather", "software_news", "hobby_news", "reminders"]
+
+system_stats:
+  live: true        # keep the SYSTEM panel updating on its own — no need to ask
+  interval: 3.0     # seconds between background telemetry pushes
+
+app_launcher:
+  # Map a spoken name to an executable path, or a "uri:" shell target (protocols / Store apps).
+  # Built-ins work with no config: notepad, calculator, paint, explorer, task manager,
+  # terminal, powershell, settings, control panel, snipping tool, camera, calendar, mail, store.
+  aliases: {}
+    # code: "C:\\Users\\you\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe"
+    # chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+    # discord: "uri:discord:"
 
 server:
   host: "127.0.0.1"

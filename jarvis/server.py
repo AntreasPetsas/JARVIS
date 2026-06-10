@@ -64,8 +64,24 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # Shared "get to know me" interview progress (typed + voice drive the same one).
     interview = InterviewState()
 
+    # Barge-in: the single most-recent in-flight reply (typed or voice). A new prompt from
+    # either path cancels it and tells every HUD to stop any audio still playing, so Jarvis
+    # breaks off mid-sentence and attends to the new request immediately.
+    inflight: dict[str, asyncio.Task | None] = {"reply": None}
+
+    async def interrupt() -> None:
+        task = inflight["reply"]
+        if task is not None and not task.done():
+            task.cancel()
+        inflight["reply"] = None
+        await hub.broadcast({"type": "stop_audio"})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Keep the SYSTEM telemetry panel live without the user asking.
+        app.state.stats_task = None
+        if cfg.get("system_stats.live", True):
+            app.state.stats_task = asyncio.create_task(_stats_loop(cfg, hub))
         # Start the microphone loop (wake word + STT) if enabled and deps present.
         app.state.voice = None
         if cfg.get("voice.enabled", True):
@@ -75,7 +91,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 loop = asyncio.get_running_loop()
 
                 async def on_command(text: str) -> None:
-                    await handle(cfg, text, hub.broadcast, history, interview)
+                    await interrupt()  # a spoken command cuts off whatever Jarvis is saying
+                    inflight["reply"] = asyncio.create_task(
+                        handle(cfg, text, hub.broadcast, history, interview))
 
                 va = VoiceAssistant(cfg, loop, hub.broadcast, on_command)
                 va.start()
@@ -86,6 +104,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         yield
         if app.state.voice is not None:
             app.state.voice.stop()
+        if app.state.stats_task is not None:
+            app.state.stats_task.cancel()
 
     app = FastAPI(title="Jarvis", lifespan=lifespan)
     app.state.cfg = cfg
@@ -139,16 +159,14 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     "message": ("Voice online — say 'Hey Jarvis', or click the mic."
                                 if app.state.voice is not None else "Voice off — type below.")})
 
-        briefing_task: asyncio.Task | None = None
-        if cfg.get("briefing.on_startup", True):
-            briefing_task = asyncio.create_task(_run_briefing(cfg, send, history))
+        # Fill the SYSTEM panel right away so a freshly-opened HUD isn't blank.
+        if cfg.get("system_stats.live", True):
+            asyncio.create_task(_push_stats(send))
 
-        async def cancel_briefing() -> None:
-            nonlocal briefing_task
-            if briefing_task is not None and not briefing_task.done():
-                briefing_task.cancel()
-                await send({"type": "stop_audio"})
-            briefing_task = None
+        # Briefing on connect is opt-in (briefing.on_startup, off by default) so Jarvis
+        # stays quiet on launch. Tracked as the in-flight reply so any command barges in.
+        if cfg.get("briefing.on_startup", False):
+            inflight["reply"] = asyncio.create_task(_run_briefing(cfg, send, history))
 
         try:
             while True:
@@ -159,12 +177,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     continue
                 mtype = msg.get("type")
                 if mtype == "command":
-                    await cancel_briefing()
-                    asyncio.create_task(handle(cfg, msg.get("text", ""), send, history, interview))
+                    await interrupt()
+                    inflight["reply"] = asyncio.create_task(
+                        handle(cfg, msg.get("text", ""), send, history, interview))
                 elif mtype == "briefing":
-                    await cancel_briefing()
-                    briefing_task = asyncio.create_task(_run_briefing(cfg, send, history))
+                    await interrupt()
+                    inflight["reply"] = asyncio.create_task(_run_briefing(cfg, send, history))
                 elif mtype == "listen":
+                    # Push-to-talk barges in: silence any reply before we start listening.
+                    await interrupt()
                     if app.state.voice is not None:
                         app.state.voice.trigger_listen()
                 elif mtype == "speaking":
@@ -187,6 +208,33 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     # Mounted last so the /ws route keeps priority over the catch-all static handler.
     app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
     return app
+
+
+async def _push_stats(send) -> None:
+    """Push a single telemetry snapshot to one client (used on connect)."""
+    try:
+        from .skills import system_stats
+        await send({"type": "panel", "panel": "system_stats", "data": await system_stats.get_stats()})
+    except Exception:  # noqa: BLE001 — best-effort, the socket may have closed
+        pass
+
+
+async def _stats_loop(cfg: Config, hub: "Hub") -> None:
+    """Broadcast live system telemetry to every HUD on a fixed cadence."""
+    from .skills import system_stats
+    interval = float(cfg.get("system_stats.interval", 3.0))
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            if not hub.clients:  # nobody watching — skip the work (and the nvidia-smi call)
+                continue
+            try:
+                stats = await system_stats.get_stats()
+                await hub.broadcast({"type": "panel", "panel": "system_stats", "data": stats})
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
+    except asyncio.CancelledError:
+        pass
 
 
 async def _run_briefing(cfg: Config, send, history: History | None = None) -> None:

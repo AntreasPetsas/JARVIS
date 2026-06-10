@@ -154,6 +154,45 @@ html, body {
 .np-album { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .np-status { margin-top: 6px; font-family: "Orbitron", sans-serif; font-size: 11px; letter-spacing: 2px; color: var(--green); }
 
+/* ---- System telemetry ---- */
+.st-row { margin-bottom: 12px; }
+.st-row:last-child { margin-bottom: 0; }
+.st-top { display: flex; justify-content: space-between; align-items: baseline; }
+.st-k { font-family: "Orbitron", sans-serif; font-size: 11px; letter-spacing: 1.5px; color: var(--cyan); }
+.st-v { font-size: 13px; color: var(--text); }
+.st-bar {
+  margin-top: 5px; height: 7px; border-radius: 4px; overflow: hidden;
+  background: rgba(54, 230, 255, 0.10); border: 1px solid rgba(54, 230, 255, 0.18);
+}
+.st-bar > i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--cyan-dim), var(--cyan));
+  box-shadow: 0 0 10px rgba(54, 230, 255, 0.5); transition: width 0.5s ease;
+}
+.st-bar.warn > i {
+  background: linear-gradient(90deg, #b06a1a, var(--amber));
+  box-shadow: 0 0 10px rgba(255, 179, 71, 0.5);
+}
+.st-meta {
+  margin-top: 13px; font-family: "Orbitron", sans-serif; font-size: 11px;
+  letter-spacing: 2px; color: var(--muted);
+}
+
+/* ---- Timers ---- */
+.timers { list-style: none; display: flex; flex-direction: column; gap: 13px; }
+.tm-row { display: flex; justify-content: space-between; align-items: baseline; }
+.tm-label { font-size: 13px; color: var(--cyan); text-transform: uppercase; letter-spacing: 1px; }
+.tm-time { font-family: "Orbitron", sans-serif; font-size: 21px; color: #eafaff; text-shadow: var(--glow); }
+.tm-bar {
+  margin-top: 6px; height: 6px; border-radius: 4px; overflow: hidden;
+  background: rgba(70, 255, 176, 0.10); border: 1px solid rgba(70, 255, 176, 0.2);
+}
+.tm-bar > i {
+  display: block; height: 100%;
+  background: linear-gradient(90deg, var(--cyan-dim), var(--green));
+  box-shadow: 0 0 10px rgba(70, 255, 176, 0.5); transition: width 0.9s linear;
+}
+
 /* ---- Center reactor ---- */
 .reactor-wrap { position: relative; width: 440px; height: 440px; max-width: 44vw; max-height: 44vw; }
 #reactor { width: 100%; height: 100%; }

@@ -104,6 +104,55 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "timer_action",
+        "description": "Create, cancel, reset, or list countdown timers. Use ONLY for explicit "
+                       "timer/countdown requests, not calendar reminders or to-dos. To start "
+                       "several timers at once, emit one call per timer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["start", "cancel", "reset", "list"]},
+                "duration_seconds": {"type": "integer",
+                                     "description": "Length in seconds, for action 'start' or "
+                                                    "'reset' (e.g. 10 minutes = 600, 1m30s = 90)."},
+                "label": {"type": "string",
+                          "description": "For 'start', an optional name ('pasta', 'tea'). For "
+                                         "'cancel'/'reset', picks which timer by name. Never a "
+                                         "number word."},
+                "all": {"type": "boolean",
+                        "description": "For 'cancel'/'reset': apply to every running timer."},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "get_system_stats",
+        "description": "Report this PC's live CPU, memory, disk, and (if present) GPU usage. Use "
+                       "when the user asks how the system/computer is doing or about CPU, RAM, "
+                       "memory, GPU, VRAM, disk, or battery. Never for general chit-chat.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "metric": {"type": "string", "enum": ["all", "cpu", "mem", "gpu", "disk", "battery"],
+                           "description": "Which figure the user wants; omit or 'all' for a summary."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "launch_app",
+        "description": "Open a desktop application by name (e.g. Notepad, Calculator, Settings, "
+                       "Chrome, VS Code). Use ONLY when the user asks to open, launch, or start "
+                       "a named app — never for opening files, URLs, or messages.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app": {"type": "string", "description": "The application name to open."},
+            },
+            "required": ["app"],
+        },
+    },
+    {
         "name": "daily_briefing",
         "description": "Give the full spoken daily briefing (weather, news and reminders).",
         "parameters": {"type": "object", "properties": {}, "required": []},

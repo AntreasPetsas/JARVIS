@@ -7,15 +7,18 @@
     weather: $("weather-body"), software: $("software-body"),
     hobby: $("hobby-body"), reminders: $("reminders-body"),
     nowplaying: $("nowplaying-body"),
+    system: $("system-body"), timers: $("timers-body"),
     transcript: $("transcript"), form: $("cmd-form"), input: $("cmd-input"),
     brief: $("brief-btn"), mic: $("mic-btn"),
   };
+  let activeTimers = [];   // live countdown state (declared early: the clock tick repaints it)
 
   // ---------- Clock ----------
   const tick = () => {
     const d = new Date();
     els.clock.textContent = d.toLocaleTimeString("en-GB");
     els.date.textContent = d.toLocaleDateString("en-GB", { weekday: "short", day: "2-digit", month: "short" });
+    if (activeTimers.length) paintTimers();
   };
   setInterval(tick, 1000); tick();
 
@@ -112,6 +115,7 @@
     return voices.find((v) => v.lang && v.lang.startsWith("en")) || null;
   }
   function speak(text) {
+    stopCurrentSource();   // don't let a previous edge-tts clip play under this reply
     const synth = window.speechSynthesis;
     const ms = Math.max(2500, text.split(/\s+/).length * 380);
     if (!synth) {
@@ -132,10 +136,20 @@
 
   // ---------- High-quality voice (edge-tts) playback + live waveform ----------
   let audioCtx = null, analyser = null, freqData = null, audioPlaying = false, currentSrc = null;
+  // Stop just the playing node (no state/message churn) — used when one reply replaces another.
+  function stopCurrentSource() {
+    if (currentSrc) {
+      try { currentSrc.onended = null; currentSrc.stop(); } catch (_) {}
+      currentSrc = null;
+    }
+  }
+  // Full barge-in: cut edge-tts audio AND browser speech, idle the reactor, un-mute the wake word.
   function stopAudio() {
-    if (currentSrc) { try { currentSrc.stop(); } catch (_) {} currentSrc = null; }
-    if (synth) synth.cancel();
+    stopCurrentSource();
+    if (window.speechSynthesis) { try { speechSynthesis.cancel(); } catch (_) {} }
+    clearTimeout(speak._t);
     audioPlaying = false; voiceLevel = null; setState("idle");
+    send({ type: "speaking", on: false });
   }
   function ensureAudio() {
     if (!audioCtx) {
@@ -152,6 +166,8 @@
   async function playAudioB64(b64) {
     ensureAudio();
     if (!audioCtx) throw new Error("no audio context");
+    stopCurrentSource();                                  // replace any reply still playing
+    if (window.speechSynthesis) { try { speechSynthesis.cancel(); } catch (_) {} }
     const bin = atob(b64), bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     const buf = await audioCtx.decodeAudioData(bytes.buffer);
@@ -160,11 +176,9 @@
     currentSrc = src;
     setState("speaking"); audioPlaying = true;
     send({ type: "speaking", on: true, seconds: buf.duration }); // pause wake word so we don't hear ourselves
-    let finished = false;
     const finish = () => {
-      if (finished) return;
-      finished = true;
-      if (currentSrc === src) currentSrc = null;
+      if (currentSrc !== src) return;   // superseded by a newer reply (barge-in) — leave it alone
+      currentSrc = null;
       audioPlaying = false; voiceLevel = null; setState("idle");
       send({ type: "speaking", on: false });
     };
@@ -220,6 +234,50 @@
         </div>
       </div>`;
   }
+  function statBar(label, pct, detail, warnAt) {
+    pct = Math.max(0, Math.min(100, Math.round(pct || 0)));
+    const warn = warnAt && pct >= warnAt ? " warn" : "";
+    return `<div class="st-row">
+      <div class="st-top"><span class="st-k">${esc(label)}</span><span class="st-v">${esc(detail)}</span></div>
+      <div class="st-bar${warn}"><i style="width:${pct}%"></i></div></div>`;
+  }
+  function renderSystem(d) {
+    if (!d || !d.ok) { els.system.innerHTML = `<div class="muted">${esc((d && d.error) || "Telemetry unavailable.")}</div>`; return; }
+    let html = statBar("CPU", d.cpu.percent, `${d.cpu.percent}%${d.cpu.cores ? " · " + d.cpu.cores + " cores" : ""}`, 85);
+    html += statBar("MEMORY", d.mem.percent, `${d.mem.used_gb} / ${d.mem.total_gb} GB`, 90);
+    if (d.gpu) {
+      html += statBar("GPU", d.gpu.percent, `${d.gpu.percent}%${d.gpu.temp != null ? " · " + d.gpu.temp + "°C" : ""}`, 90);
+      html += statBar(`VRAM${d.gpu.name ? " · " + d.gpu.name.replace(/NVIDIA\s*/i, "") : ""}`, d.gpu.mem_percent, `${d.gpu.mem_used_mb} / ${d.gpu.mem_total_mb} MB`, 90);
+    }
+    if (d.disk) html += statBar(`DISK ${d.disk.mount || ""}`, d.disk.percent, `${d.disk.used_gb} / ${d.disk.total_gb} GB`, 90);
+    const meta = [];
+    if (d.uptime) meta.push(`UP ${d.uptime}`);
+    if (d.battery) meta.push(`BAT ${d.battery.percent}%${d.battery.plugged ? " ⚡" : ""}`);
+    if (meta.length) html += `<div class="st-meta">${esc(meta.join("  ·  "))}</div>`;
+    els.system.innerHTML = html;
+  }
+
+  // Live countdown: the backend pushes the list once; we tick it down locally.
+  function fmtClock(secs) {
+    secs = Math.max(0, Math.round(secs));
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return (h ? pad(h) + ":" : "") + pad(m) + ":" + pad(s);
+  }
+  function renderTimers(items) { activeTimers = Array.isArray(items) ? items.slice() : []; paintTimers(); }
+  function paintTimers() {
+    if (!els.timers) return;
+    if (!activeTimers.length) { els.timers.innerHTML = `<div class="muted">No active timers.</div>`; return; }
+    const now = Date.now();
+    els.timers.innerHTML = `<ul class="timers">` + activeTimers.map((t) => {
+      const remaining = Math.max(0, (t.ends_at - now) / 1000);
+      const pct = t.total ? Math.max(0, Math.min(100, (remaining / t.total) * 100)) : 0;
+      return `<li>
+        <div class="tm-row"><span class="tm-label">${t.label ? esc(t.label) : "Timer"}</span><span class="tm-time">${fmtClock(remaining)}</span></div>
+        <div class="tm-bar"><i style="width:${pct}%"></i></div></li>`;
+    }).join("") + `</ul>`;
+  }
+
   function renderReminders(items) {
     if (!items || !items.length) { els.reminders.innerHTML = `<div class="muted">No tasks logged.</div>`; return; }
     els.reminders.innerHTML = `<ul class="todo">` + items.map((r) =>
@@ -272,6 +330,8 @@
           else if (m.panel === "hobby_news") renderFeed(els.hobby, m.data);
           else if (m.panel === "reminders") renderReminders(m.data);
           else if (m.panel === "nowplaying") renderNowPlaying(m.data);
+          else if (m.panel === "system_stats") renderSystem(m.data);
+          else if (m.panel === "timers") renderTimers(m.data);
           break;
       }
     };
@@ -284,12 +344,14 @@
     e.preventDefault();
     const text = els.input.value.trim();
     if (!text) return;
+    stopAudio();                         // barge-in: cut off any reply still speaking
     send({ type: "command", text });
     els.input.value = "";
   });
-  els.brief.addEventListener("click", () => send({ type: "briefing" }));
+  els.brief.addEventListener("click", () => { stopAudio(); send({ type: "briefing" }); });
   els.mic.addEventListener("click", () => {
     ensureAudio();
+    stopAudio();                         // barge-in: silence Jarvis before we listen
     send({ type: "listen" });
     setState("listening");
     els.subtitle.textContent = "Listening… speak now.";

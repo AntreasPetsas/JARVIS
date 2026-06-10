@@ -50,8 +50,15 @@ _DEFAULTS: dict[str, Any] = {
         "default_device": "",
     },
     "briefing": {
-        "on_startup": True,
+        "on_startup": False,  # stay quiet on launch — only brief when explicitly asked
         "sections": ["greeting", "weather", "software_news", "hobby_news", "reminders"],
+    },
+    "system_stats": {
+        "live": True,       # keep the SYSTEM panel updating on its own (no need to ask)
+        "interval": 3.0,    # seconds between background telemetry pushes
+    },
+    "app_launcher": {
+        "aliases": {},  # spoken name -> exe path or "uri:<target>"; built-in apps work without this
     },
     "voice": {
         "enabled": True,         # run the mic loop (wake word + speech-to-text)

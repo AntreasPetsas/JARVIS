@@ -14,7 +14,8 @@ from typing import Awaitable, Callable
 from .config import Config
 from .llm import TOOLS, get_llm
 from .memory_store import ConversationStore
-from .skills import news, onboarding, profile, reminders, spotify, weather
+from .skills import (app_launcher, news, onboarding, profile, reminders, spotify,
+                     system_stats, timers, weather)
 from .skills.briefing import spoken_briefing
 from .skills.onboarding import InterviewState
 from .skills.spotify_api import get_spotify
@@ -66,8 +67,9 @@ CHAT_SYSTEM = (
 )
 AGENT_SYSTEM = (
     "You are Jarvis, a witty British AI butler for a software engineer. You have tools "
-    "to check the weather, fetch news, manage reminders, control Spotify, and give a "
-    "daily briefing. Only call a tool when the user explicitly asks for one of those "
+    "to check the weather, fetch news, manage reminders, control Spotify, set countdown "
+    "timers, report this PC's system stats, open desktop apps, and give a daily briefing. "
+    "Only call a tool when the user explicitly asks for one of those "
     "specific capabilities. For greetings, messages to pass on, general questions, or "
     "anything conversational, reply directly without calling any tool. "
     "Replies are spoken aloud, so keep them short with no markdown."
@@ -141,6 +143,10 @@ TOOL_HINT_RE = re.compile(
     r"play|pause|resume|skip|song|track|album|artist|playlist|music|spotify|volume|"
     r"louder|quieter|mute|tune|shuffle|repeat|loop|queue|devices?|"
     r"remind|reminders?|tasks?|to-?dos?|remember|forget|"
+    r"timers?|countdown|stopwatch|"
+    r"cpu|gpu|vram|ram|processor|battery|telemetry|memory usage|disk usage|"
+    r"system stats|system status|"
+    r"launch|"
     r"brief|briefing|catch me up|update me)\b",
     re.IGNORECASE,
 )
@@ -189,6 +195,21 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
             return
         if await _memory_command(cfg, t, low, send, history):
             return
+
+    # --- Timers (checked before Spotify so "stop the timer" isn't read as "stop music") ---
+    if re.search(r"\b(timers?|countdown|stopwatch)\b", low):
+        await _timers(cfg, t, low, send, history)
+        return
+
+    # --- System stats / telemetry (the panel is always live; this answers a spoken query
+    #     like "cpu?", "cpu usage", "how much RAM", or "system stats") ---
+    metrics = system_stats.match(low)
+    if metrics:
+        await send({"type": "state", "state": "thinking"})
+        stats = await system_stats.get_stats()
+        await send({"type": "panel", "panel": "system_stats", "data": stats})
+        await say(cfg, send, history, system_stats.answer(stats, metrics))
+        return
 
     # --- Daily briefing ---
     if re.search(r"\b(brief|briefing|catch me up|what'?s going on|update me)\b", low):
@@ -282,6 +303,19 @@ async def handle(cfg: Config, text: str, send: Send, history: History | None = N
         await say(cfg, send, history,("Your reminders: " + "; ".join(r["text"] for r in items[:5]) + ".")
                          if items else "You have no reminders. Try: 'remind me to push the branch'.")
         return
+
+    # --- App launcher ("open notepad", "launch chrome"). Only handles the request when
+    #     the target resolves to a known app — otherwise it falls through to the LLM so
+    #     phrasings like "open up to me" stay conversation. ---
+    am = re.search(r"\b(?:launch|open|run|start|fire up|boot up|bring up)\s+"
+                   r"(?:the\s+|my\s+|up\s+)?(.+)", t, re.IGNORECASE)
+    if am:
+        target = app_launcher.clean_target(am.group(1))
+        if target:
+            res = app_launcher.launch(target, cfg.get("app_launcher.aliases", {}))
+            if res.get("resolved"):
+                await say(cfg, send, history, res["message"])
+                return
 
     # --- Fallback: let the model answer or pick a skill itself (tool-calling) ---
     await send({"type": "state", "state": "thinking"})
@@ -620,6 +654,238 @@ def _parse_play_query(text: str):
     return q, kind
 
 
+# --- Timers & system telemetry --------------------------------------------------
+
+def _timer_fire(cfg: Config, send: Send):
+    """Build the callback a timer runs when it elapses: refresh the panel and announce."""
+    async def _fire(timer: dict) -> None:
+        try:
+            await send({"type": "panel", "panel": "timers", "data": timers.list_timers()})
+            label = timer.get("label")
+            spoken = (f"Your {label} timer is up, sir." if label
+                      else f"That's time — your {timers.humanize(timer['total'])} timer is up, sir.")
+            await say(cfg, send, None, spoken)  # history=None: don't log timer chimes as chat
+        except Exception:  # noqa: BLE001 — the HUD may have disconnected before it fired
+            pass
+    return _fire
+
+
+_LABEL_STOP = {"minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+               "second", "seconds", "sec", "secs", "countdown", "stopwatch",
+               "quick", "short", "long", "new", "another", "my", "the", "a", "an", "one",
+               "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+               "couple", "few", "several", "some", "multiple", "both", "set", "add", "make",
+               "create", "start", "please", "also", "first", "second", "next"}
+
+
+def _timer_label(low: str) -> str:
+    """Best-effort label: 'name as X' / 'call it X', a quoted name, 'timer for/called X',
+    or the word right before '<X> timer'."""
+    # Explicit naming: "name (it/this) (as) X", "call it X", "named/called/labeled X".
+    m = re.search(r"\b(?:name|call|label)(?:\s+it|\s+this)?\s+(?:as\s+|it\s+|this\s+)?"
+                  r"[\"']?([a-z][\w ]{0,24}?)[\"']?\s*$", low)
+    if m and m.group(1).strip() not in _LABEL_STOP:
+        return m.group(1).strip()
+    m = re.search(r"\b(?:named|called|labell?ed)\s+[\"']?([a-z][\w ]{0,24}?)[\"']?\s*$", low)
+    if m and m.group(1).strip() not in _LABEL_STOP:
+        return m.group(1).strip()
+    # A quoted name anywhere ("set a 5 min 'pasta' timer").
+    m = re.search(r"[\"']([a-z][\w ]{0,28})[\"']", low)
+    if m and m.group(1).strip() not in _LABEL_STOP:
+        return m.group(1).strip()
+    m = re.search(r"\btimers?\s+(?:for|called|named|labell?ed)\s+(?!\d)([a-z][a-z ]{0,24})", low)
+    if m and m.group(1).strip() not in _LABEL_STOP:
+        return m.group(1).strip()
+    # The word right before "timer" — e.g. "5 minute pasta timer" -> "pasta".
+    for m in re.finditer(r"\b([a-z]+)\s+timers?\b", low):
+        if m.group(1) not in _LABEL_STOP:
+            return m.group(1)
+    return ""
+
+
+def _timer_name(t: dict) -> str:
+    return f"{t['label']} timer" if t.get("label") else f"{timers.humanize(t['total'])} timer"
+
+
+def _timers_phrase(items: list[dict]) -> str:
+    return ", ".join((f"{it['label']}: " if it['label'] else "") + f"{timers.humanize(it['remaining'])} left"
+                     for it in items[:5])
+
+
+def _cancel_target(low: str) -> str:
+    """The label between a cancel/reset verb and the word 'timer' ('cancel the tea timer')."""
+    m = re.search(r"\b(?:cancel|stop|clear|delete|remove|abort|kill|end|reset)\s+"
+                  r"(?:the\s+|my\s+)?(.*?)\s*timers?\b", low)
+    if m:
+        cand = re.sub(r"^(?:a|an|the|my)\s+", "", m.group(1).strip()).strip()
+        if cand and cand not in _LABEL_STOP:
+            return cand
+    return ""
+
+
+def _multi_timer_durations(low: str) -> list[tuple[int, str]] | None:
+    """Parse a clear multi-timer request ('two timers, one at 10 and one at 20 minutes').
+
+    Only fires when the phrasing signals several timers (plural 'timers', 'one at/for…',
+    'another'), so 'a timer for 1 hour and 30 minutes' stays a single 90-minute timer.
+    """
+    cue = (re.search(r"\btimers\b", low) or re.search(r"\bone\s+(?:at|for|of|is)\b", low)
+           or " another " in f" {low} ")
+    if not cue:
+        return None
+    out = []
+    for seg in re.split(r"\s*(?:,|;|\band\b|\balso\b|\bplus\b|\bthen\b)\s*", low):
+        secs = timers.parse_duration(seg)
+        if secs:
+            out.append((secs, _timer_label(seg)))
+    return out if len(out) >= 2 else None
+
+
+def _timer_fire(cfg: Config, send: Send):
+    """Build the callback a timer runs when it elapses: refresh the panel and announce."""
+    async def _fire(timer: dict) -> None:
+        try:
+            await send({"type": "panel", "panel": "timers", "data": timers.list_timers()})
+            label = timer.get("label")
+            spoken = (f"Your {label} timer is up, sir." if label
+                      else f"That's time — your {timers.humanize(timer['total'])} timer is up, sir.")
+            await say(cfg, send, None, spoken)  # history=None: don't log timer chimes as chat
+        except Exception:  # noqa: BLE001 — the HUD may have disconnected before it fired
+            pass
+    return _fire
+
+
+async def _run_timer_op(cfg: Config, send: Send, args: dict) -> str:
+    """Execute one timer operation (start / cancel / reset / list) and refresh the panel.
+
+    Shared by the keyword timer handler and the `timer_action` tool (general LLM agent).
+    """
+    action = (args.get("action") or "start").lower()
+    fire = _timer_fire(cfg, send)
+
+    async def push() -> None:
+        await send({"type": "panel", "panel": "timers", "data": timers.list_timers()})
+
+    if action == "list":
+        items = timers.list_timers()
+        await push()
+        if not items:
+            return "No timers are running, sir."
+        return f"{len(items)} timer{'s' if len(items) != 1 else ''} running — {_timers_phrase(items)}."
+
+    if action == "cancel":
+        items = timers.list_timers()
+        if not items:
+            return "There are no timers to cancel, sir."
+        if args.get("all"):
+            n = timers.cancel_all()
+            await push()
+            return f"Cleared {n} timer{'s' if n != 1 else ''}."
+        label = (args.get("label") or "").strip()
+        if not label and len(items) > 1:
+            return ("You have " + _timers_phrase(items)
+                    + ". Which should I cancel, or shall I clear them all?")
+        c = timers.cancel_timer(label)
+        await push()
+        if c:
+            return f"Cancelled the {_timer_name(c)}."
+        return (f"I don't see a timer matching '{label}', sir." if label
+                else "I couldn't find that timer, sir.")
+
+    if action == "reset":
+        items = timers.list_timers()
+        if not items:
+            return "There are no timers to reset, sir."
+        new_secs = int(args.get("duration_seconds") or 0)
+        if args.get("all"):
+            timers.cancel_all()
+            for it in items:
+                timers.start_timer(new_secs or it["total"], it["label"], fire)
+            await push()
+            return f"Reset {len(items)} timer{'s' if len(items) != 1 else ''}."
+        label = (args.get("label") or "").strip()
+        if not label and len(items) > 1:
+            return "You have " + _timers_phrase(items) + ". Which should I reset?"
+        c = timers.cancel_timer(label)
+        if not c:
+            return (f"I don't see a timer matching '{label}', sir." if label
+                    else "I couldn't find that timer, sir.")
+        secs = new_secs or c["total"]
+        timers.start_timer(secs, c["label"], fire)
+        await push()
+        return f"Reset the {_timer_name(c)} to {timers.humanize(secs)}."
+
+    # start
+    secs = int(args.get("duration_seconds") or 0)
+    if secs <= 0:
+        return "I need a duration for the timer, sir."
+    label = (args.get("label") or "").strip()
+    if label.lower() in _LABEL_STOP:
+        label = ""
+    timers.start_timer(secs, label, fire)
+    await push()
+    return f"Timer set for {timers.humanize(secs)}" + (f", for {label}." if label else ".")
+
+
+async def _timers(cfg: Config, t: str, low: str, send: Send, history: History) -> None:
+    """Deterministic timer control. Durations and labels are parsed locally — far more
+    reliable than a small LLM, which mis-reads '4:45' / '4 mins' and can emit a spurious
+    cancel that wipes a running timer."""
+    await send({"type": "state", "state": "thinking"})
+
+    # Multiple timers in one go ("two timers, one at 10 and one at 20 minutes").
+    multi = _multi_timer_durations(low)
+    if multi:
+        results = [await _run_timer_op(cfg, send, {"action": "start", "duration_seconds": s, "label": lbl})
+                   for s, lbl in multi]
+        await say(cfg, send, history, " ".join(results))
+        return
+
+    secs = timers.parse_duration(low)
+    creating = bool(secs) and re.search(r"\b(set|start|create|add|new|begin|make|put|run|need|give)\b", low)
+
+    # An explicit "set/start … timer for <duration>" always creates — even if the label
+    # happens to contain a word like 'remove'.
+    if creating:
+        await say(cfg, send, history, await _run_timer_op(
+            cfg, send, {"action": "start", "duration_seconds": secs, "label": _timer_label(low)}))
+        return
+
+    if re.search(r"\breset\b", low):
+        args: dict = {"action": "reset"}
+        if re.search(r"\b(all|every|everything|them all|the timers)\b", low):
+            args["all"] = True
+        elif _cancel_target(low):
+            args["label"] = _cancel_target(low)
+        if secs:
+            args["duration_seconds"] = secs
+        await say(cfg, send, history, await _run_timer_op(cfg, send, args))
+        return
+
+    if re.search(r"\b(cancel|stop|clear|delete|remove|abort|kill|end|scrap|dismiss)\b", low):
+        args = {"action": "cancel"}
+        if re.search(r"\b(all|every|everything|them all|the timers)\b", low):
+            args["all"] = True
+        elif _cancel_target(low):
+            args["label"] = _cancel_target(low)
+        await say(cfg, send, history, await _run_timer_op(cfg, send, args))
+        return
+
+    if (re.search(r"\b(list|show|what|which|how many|remaining|left|any|running|status|going)\b", low)
+            and secs is None):
+        await say(cfg, send, history, await _run_timer_op(cfg, send, {"action": "list"}))
+        return
+
+    # A bare duration with no verb ("10 minute timer") still starts.
+    if secs:
+        await say(cfg, send, history, await _run_timer_op(
+            cfg, send, {"action": "start", "duration_seconds": secs, "label": _timer_label(low)}))
+        return
+
+    await say(cfg, send, history,
+              "How long should the timer run, sir? Try 'set a timer for 5 minutes'.")
+
+
 # --- LLM agent: the model picks a skill (tool-call), we run it, it narrates -----
 async def _agent(cfg: Config, t: str, send: Send, history: History) -> None:
     llm = get_llm(cfg)
@@ -707,6 +973,22 @@ async def _run_tool(cfg: Config, send: Send, name: str, args: dict) -> str:
 
     if name == "control_spotify":
         return await _run_spotify_tool(cfg, send, args)
+
+    if name == "timer_action":
+        return await _run_timer_op(cfg, send, args)
+
+    if name == "get_system_stats":
+        stats = await system_stats.get_stats()
+        await send({"type": "panel", "panel": "system_stats", "data": stats})
+        metric = (args.get("metric") or "all").lower()
+        return system_stats.answer(stats, [metric])
+
+    if name == "launch_app":
+        app = (args.get("app") or "").strip()
+        if not app:
+            return "Which app should I open?"
+        return app_launcher.launch(app, cfg.get("app_launcher.aliases", {})).get(
+            "message", f"Opening {app}.")
 
     if name == "daily_briefing":
         result = await spoken_briefing(cfg)

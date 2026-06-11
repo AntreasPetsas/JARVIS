@@ -27,10 +27,15 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
 SCOPES = ("user-read-playback-state user-modify-playback-state "
-          "user-read-currently-playing user-library-read")
+          "user-read-currently-playing user-library-read "
+          "playlist-read-private playlist-read-collaborative")
 
 DATA = Path(__file__).resolve().parent.parent / "data"
 TOKEN_STORE = DATA / "spotify_token.json"
+# A small rolling stack of the playlists/albums Jarvis has started, so "play the
+# previous playlist" can return to the last context. Spotify has no API for this.
+CONTEXT_STORE = DATA / "spotify_contexts.json"
+CONTEXT_MAX = 20
 
 
 class SpotifyWeb:
@@ -63,6 +68,37 @@ class SpotifyWeb:
     def _save_tokens(self, data: dict) -> None:
         DATA.mkdir(parents=True, exist_ok=True)
         TOKEN_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # ---- context history (for "play the previous playlist") -------------
+    def _contexts(self) -> list[dict]:
+        if not CONTEXT_STORE.exists():
+            return []
+        try:
+            data = json.loads(CONTEXT_STORE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (json.JSONDecodeError, OSError):
+            return []
+
+    def _save_contexts(self, items: list[dict]) -> None:
+        DATA.mkdir(parents=True, exist_ok=True)
+        CONTEXT_STORE.write_text(json.dumps(items[-CONTEXT_MAX:], indent=2), encoding="utf-8")
+
+    def _record_context(self, uri: str, name: str, kind: str, extra: dict | None = None) -> None:
+        """Push a started context onto the history stack (no consecutive dupes).
+
+        `kind` is normally playlist/album/artist; "liked" is a sentinel for Liked
+        Songs, which has no context URI. `extra` carries kind-specific state (e.g.
+        the shuffle flag) so the context can be replayed faithfully."""
+        if not uri:
+            return
+        items = self._contexts()
+        if items and items[-1].get("uri") == uri:
+            return
+        rec = {"uri": uri, "name": name, "kind": kind}
+        if extra:
+            rec.update(extra)
+        items.append(rec)
+        self._save_contexts(items)
 
     def _basic_auth(self) -> str:
         raw = f"{self.client_id}:{self.client_secret}".encode()
@@ -336,7 +372,8 @@ class SpotifyWeb:
                                        params={"q": query, "type": "track", "limit": 5})
         if status != 200:
             return self._result(status, "", body)
-        items = (body.get("tracks") or {}).get("items", [])
+        # Spotify occasionally returns null entries in the items array — drop them.
+        items = [it for it in ((body.get("tracks") or {}).get("items") or []) if it]
         if not items:
             return {"ok": False, "message": f"I couldn't find '{query}' on Spotify."}
         item = self._pick_best(items, query, "track")
@@ -350,6 +387,10 @@ class SpotifyWeb:
         """Choose the closest match instead of blindly taking the first result:
         exact name, then prefix, then (for tracks) most popular, else first."""
         q = query.strip().lower()
+        # Spotify can return null entries (e.g. unavailable playlists) — ignore them.
+        items = [it for it in items if it]
+        if not items:
+            return {}
         exact = [it for it in items if (it.get("name") or "").lower() == q]
         if exact:
             if kind == "track":
@@ -360,17 +401,63 @@ class SpotifyWeb:
             return prefix[0]
         return items[0]
 
+    # ---- the user's own playlists ---------------------------------------
+    async def _my_playlists(self) -> list[dict]:
+        """All playlists the user owns or follows (paged). Needs the
+        playlist-read-private scope — relink Spotify if it returns nothing."""
+        out: list[dict] = []
+        for offset in range(0, 200, 50):  # up to 200 playlists, 4 pages
+            status, body = await self._api("GET", "/me/playlists",
+                                           params={"limit": 50, "offset": offset})
+            if status != 200:
+                break
+            batch = [p for p in (body.get("items") or []) if p]
+            out.extend(batch)
+            if len(batch) < 50:
+                break
+        return out
+
+    async def _find_my_playlist(self, query: str) -> dict | None:
+        """Best name match among the user's own playlists: exact, then prefix, then substring."""
+        q = query.strip().lower()
+        pls = await self._my_playlists()
+        for test in (lambda n: n == q, lambda n: n.startswith(q), lambda n: q in n):
+            hit = next((p for p in pls if test((p.get("name") or "").lower())), None)
+            if hit and hit.get("uri"):
+                return hit
+        return None
+
     async def search_and_play(self, query: str, kind: str = "track",
                               shuffle: bool = False) -> dict:
         kind = kind if kind in ("track", "album", "artist", "playlist") else "track"
+        # A named playlist is almost always one of the user's own. The public /search
+        # endpoint can't see private playlists and outranks personal ones, so look in
+        # the user's library first and only fall back to the catalog if there's no match.
+        if kind == "playlist":
+            mine = await self._find_my_playlist(query)
+            if mine:
+                if shuffle:
+                    await self.set_shuffle(True)
+                dev = await self._target_device()
+                params = {"device_id": dev} if dev else None
+                st, b = await self._api("PUT", "/me/player/play", params=params,
+                                        json_body={"context_uri": mine["uri"]})
+                res = self._result(st, "", b)
+                if res["ok"]:
+                    res["message"] = self._now_phrase(mine, "playlist")
+                    self._record_context(mine["uri"], mine.get("name", ""), "playlist")
+                return res
         status, body = await self._api("GET", "/search",
                                        params={"q": query, "type": kind, "limit": 5})
         if status != 200:
             return self._result(status, "", body)
-        items = (body.get(kind + "s") or {}).get("items", [])
+        # Spotify occasionally returns null entries in the items array — drop them.
+        items = [it for it in ((body.get(kind + "s") or {}).get("items") or []) if it]
         if not items:
             return {"ok": False, "message": f"I couldn't find a {kind} for '{query}' on Spotify."}
         item = self._pick_best(items, query, kind)
+        if not item.get("uri"):
+            return {"ok": False, "message": f"I couldn't find a {kind} for '{query}' on Spotify."}
         # For a context (album/artist/playlist), set shuffle first so it starts shuffled.
         if shuffle and kind != "track":
             await self.set_shuffle(True)
@@ -381,6 +468,30 @@ class SpotifyWeb:
         res = self._result(st, "", b)
         if res["ok"]:
             res["message"] = self._now_phrase(item, kind)
+            if kind in ("album", "artist", "playlist"):
+                self._record_context(item["uri"], item.get("name", ""), kind)
+        return res
+
+    async def play_previous_context(self) -> dict:
+        """Replay the playlist/album started just before the current one. Toggles
+        between the last two contexts on repeated calls."""
+        items = self._contexts()
+        current = items[-1] if items else None
+        cur_uri = current.get("uri") if current else None
+        prev = next((c for c in reversed(items[:-1]) if c.get("uri") != cur_uri), None)
+        if not prev or not prev.get("uri"):
+            return {"ok": False, "message": "I don't have an earlier playlist to go back to, sir."}
+        # Liked Songs has no context URI — replay it via play_liked (which re-records it).
+        if prev.get("kind") == "liked":
+            return await self.play_liked(shuffle=bool(prev.get("shuffle")))
+        dev = await self._target_device()
+        params = {"device_id": dev} if dev else None
+        st, b = await self._api("PUT", "/me/player/play", params=params,
+                                json_body={"context_uri": prev["uri"]})
+        res = self._result(st, "", b)
+        if res["ok"]:
+            res["message"] = self._now_phrase(prev, prev.get("kind", "playlist"))
+            self._record_context(prev["uri"], prev.get("name", ""), prev.get("kind", "playlist"))
         return res
 
     # ---- liked / saved songs --------------------------------------------
@@ -403,7 +514,10 @@ class SpotifyWeb:
         st, b = await self._api("PUT", "/me/player/play", params=params,
                                 json_body={"uris": uris})
         msg = "Shuffling your Liked Songs." if shuffle else "Playing your Liked Songs."
-        return self._result(st, msg, b)
+        res = self._result(st, msg, b)
+        if res["ok"]:
+            self._record_context("liked", "Liked Songs", "liked", {"shuffle": shuffle})
+        return res
 
     # ---- now playing ----------------------------------------------------
     async def now_playing(self) -> dict:

@@ -120,6 +120,13 @@ SPOTIFY_PARSE_SYSTEM = (
     "'turn it up a bit' → volume, direction='up'\n"
 )
 
+# "previous/last playlist" — replay the prior context, distinct from "previous" (track).
+PREV_CONTEXT_RE = re.compile(
+    r"\b(?:previous|last|prior|earlier)\s+(?:playlist|album|context)\b"
+    r"|\bgo\s+back\s+(?:a|one)\s+(?:playlist|album)\b",
+    re.IGNORECASE,
+)
+
 # "add" phrasings — matched against the original text so casing is preserved.
 ADD_RE = re.compile(
     r"(?:remind me(?:\s+to)?|remember(?:\s+to)?|add(?:\s+a)?\s+(?:reminder|task|to-?do)"
@@ -387,7 +394,17 @@ async def _spotify_llm(cfg: Config, t: str, send: Send, history: History, llm) -
     valid = spotify_tool["parameters"]["properties"]["action"].get("enum", [])
     if (args.get("action") or "").lower() not in valid:
         return False
-    out = await _run_spotify_tool(cfg, send, args)
+    # If the user literally said "playlist", that's an unambiguous signal a weaker model
+    # sometimes drops (mapping "play the Hurts playlist" to a track). Force the kind so the
+    # search looks up a playlist — and reaches the user's own-playlist lookup.
+    if args.get("action", "").lower() == "search" and re.search(r"\bplaylist\b", t, re.IGNORECASE):
+        args["kind"] = "playlist"
+    # Never let a skill error crash the handler task with no spoken reply — degrade
+    # to a graceful apology instead (the request is still considered handled).
+    try:
+        out = await _run_spotify_tool(cfg, send, args)
+    except Exception:  # noqa: BLE001
+        out = "I hit a snag controlling Spotify — give it another go?"
     await say(cfg, send, history, out or "Done.")
     return True
 
@@ -416,6 +433,13 @@ async def _spotify(cfg: Config, t: str, low: str, send: Send, history: History) 
     if "open" in low and "spotify" in low:
         res = spotify.open_spotify(cfg.get("spotify.exe_path", ""))
         await say(cfg, send, history, res["message"])
+        return
+
+    # "previous/last playlist" — replay the prior context. Handled deterministically and
+    # before the LLM, since it's a stateful intent the model would mistake for a search.
+    if use_api and PREV_CONTEXT_RE.search(low):
+        res = await web.play_previous_context()
+        await _spotify_done(cfg, send, history, web, use_api, res)
         return
 
     # LLM intent parsing — maps natural language to a structured control_spotify call.

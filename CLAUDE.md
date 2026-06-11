@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Future work
+
+When something is decided to be deferred to a future plan — out of scope for the current
+task, blocked, or a "later" idea — record it in [`FUTURE_WORK.md`](FUTURE_WORK.md) instead
+of dropping it. Append a backlog entry in that file's format; don't let deferred work live
+only in the conversation.
+
 ## Running Jarvis
 
 ```powershell
